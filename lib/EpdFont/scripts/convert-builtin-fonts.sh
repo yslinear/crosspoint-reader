@@ -41,9 +41,17 @@ for size in ${UI_FONT_SIZES[@]}; do
     # are filled from it while every glyph Ubuntu already has stays unchanged
     # (fontstack is ordered by descending priority).
     viet_path="../builtinFonts/source/Ubuntu/Ubuntu-Vietnamese-${style}.ttf"
+    # Traditional Chinese menu glyphs: a build-time subset of Noto Sans TC limited
+    # to the characters traditional_chinese.yaml actually uses (scripts/tc-menu-chars.txt).
+    # fontconvert.py auto-trims the CJK ranges below to the glyphs this subset font
+    # carries, so the builtin stays small (a few hundred Han, not the ~20K block).
+    tc_path="../builtinFonts/source/NotoSansTC/NotoSansTC-UI-${style}.ttf"
     output_path="../builtinFonts/${font_name}.h"
-    python fontconvert.py $font_name $size $font_path $hebrew_path $viet_path \
-      --additional-intervals 0x05D0,0x05EA > $output_path
+    python fontconvert.py $font_name $size $font_path $hebrew_path $viet_path $tc_path \
+      --additional-intervals 0x05D0,0x05EA \
+      --additional-intervals 0x3000,0x303F \
+      --additional-intervals 0x4E00,0x9FFF \
+      --additional-intervals 0xFF00,0xFFEF > $output_path
     echo "Generated $output_path"
   done
 done
@@ -51,7 +59,11 @@ done
 python fontconvert.py notosans_8_regular 8 \
   ../builtinFonts/source/NotoSans/NotoSans-Regular.ttf \
   ../builtinFonts/source/NotoSansHebrew/NotoSansHebrew-Regular.ttf \
-  --additional-intervals 0x05D0,0x05EA > ../builtinFonts/notosans_8_regular.h
+  ../builtinFonts/source/NotoSansTC/NotoSansTC-UI-Regular.ttf \
+  --additional-intervals 0x05D0,0x05EA \
+  --additional-intervals 0x3000,0x303F \
+  --additional-intervals 0x4E00,0x9FFF \
+  --additional-intervals 0xFF00,0xFFEF > ../builtinFonts/notosans_8_regular.h
 
 echo ""
 echo "Running compression verification..."
