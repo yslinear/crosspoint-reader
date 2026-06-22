@@ -298,6 +298,10 @@ void setupDisplayAndFonts(bool seamless = false) {
 
   // Discover and load SD card fonts
   sdFontSystem.begin(renderer);
+  // Route UI glyph misses (e.g. CJK in titles) to the SD fallback font, if any.
+  // 0 when no CJK fallback is installed — leaves the historic replacement-glyph
+  // behavior unchanged.
+  renderer.setUiFallbackFont(sdFontSystem.getUiFallbackFontId());
 
   LOG_DBG("MAIN", "Fonts setup");
 }

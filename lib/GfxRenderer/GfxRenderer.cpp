@@ -54,6 +54,30 @@ const uint8_t* GfxRenderer::getGlyphBitmap(const EpdFontData* fontData, const Ep
   return &fontData->bitmap[glyph->dataOffset];
 }
 
+GfxRenderer::ResolvedGlyph GfxRenderer::resolveGlyph(const EpdFontFamily& primary, uint32_t cp,
+                                                     EpdFontFamily::Style style) const {
+  // 1) Primary UI font covers the codepoint — the common Latin path.
+  if (const EpdGlyph* g = primary.tryGetGlyph(cp, style)) {
+    return {g, primary.getData(style)};
+  }
+  // 2) Primary misses: consult the UI->CJK fallback font if one is registered.
+  if (uiFallbackFontId_ != 0) {
+    const auto it = fontMap.find(uiFallbackFontId_);
+    if (it != fontMap.end()) {
+      const EpdFontFamily& fallback = it->second;
+      // NOTE: this may load the glyph into the fallback's SD overflow ring,
+      // invalidating any previously-returned SD glyph pointer. Callers must
+      // consume one ResolvedGlyph before resolving the next.
+      if (const EpdGlyph* fg = fallback.tryGetGlyph(cp, style)) {
+        return {fg, fallback.getData(style)};
+      }
+    }
+  }
+  // 3) No coverage anywhere: fall back to the primary's replacement glyph,
+  // preserving the historic behavior (getGlyph never returns nullptr).
+  return {primary.getGlyph(cp, style), primary.getData(style)};
+}
+
 void GfxRenderer::ensureSdCardFontReady(int fontId, const char* utf8Text, uint8_t styleMask) const {
   auto it = sdCardFonts_.find(fontId);
   if (it != sdCardFonts_.end()) {
@@ -145,13 +169,13 @@ enum class TextRotation { None, Rotated90CW };
 //
 // The advance width is also halved in drawText() so layout reserves exactly the right
 // horizontal space for the scaled glyph.
-static void renderCharScaled(const GfxRenderer& renderer, GfxRenderer::RenderMode renderMode,
-                             const EpdFontFamily& fontFamily, const uint32_t cp, int cursorX, int cursorY,
-                             const bool pixelState, const EpdFontFamily::Style style) {
-  const EpdGlyph* glyph = fontFamily.getGlyph(cp, style);
+// glyph + fontData must be a matched pair from GfxRenderer::resolveGlyph (the
+// glyph indexes into fontData) so the UI->CJK fallback renders from the right
+// font. The SD overflow glyph pointer must not be re-resolved before this draws.
+static void renderCharScaled(const GfxRenderer& renderer, GfxRenderer::RenderMode renderMode, const EpdGlyph* glyph,
+                             const EpdFontData* fontData, int cursorX, int cursorY, const bool pixelState) {
   if (!glyph) return;
 
-  const EpdFontData* fontData = fontFamily.getData(style);
   const uint8_t* bitmap = renderer.getGlyphBitmap(fontData, glyph);
   if (!bitmap) return;
 
@@ -212,17 +236,18 @@ static void renderCharScaled(const GfxRenderer& renderer, GfxRenderer::RenderMod
   }
 }
 
+// glyph + fontData must be a matched pair from GfxRenderer::resolveGlyph so the
+// is2Bit/ascender reads and getGlyphBitmap() index into the SAME font (mixing a
+// fallback glyph with the primary's data yields garbage / misaligned reads).
+// The SD overflow glyph pointer must not be re-resolved before this consumes it.
 template <TextRotation rotation = TextRotation::None>
-static void renderCharImpl(const GfxRenderer& renderer, GfxRenderer::RenderMode renderMode,
-                           const EpdFontFamily& fontFamily, const uint32_t cp, int cursorX, int cursorY,
-                           const bool pixelState, const EpdFontFamily::Style style) {
-  const EpdGlyph* glyph = fontFamily.getGlyph(cp, style);
+static void renderCharImpl(const GfxRenderer& renderer, GfxRenderer::RenderMode renderMode, const EpdGlyph* glyph,
+                           const EpdFontData* fontData, int cursorX, int cursorY, const bool pixelState) {
   if (!glyph) {
-    LOG_ERR("GFX", "No glyph for codepoint %d", cp);
+    LOG_ERR("GFX", "No glyph to render");
     return;
   }
 
-  const EpdFontData* fontData = fontFamily.getData(style);
   const bool is2Bit = fontData->is2Bit;
   const uint8_t width = glyph->width;
   const uint8_t height = glyph->height;
@@ -374,9 +399,39 @@ int GfxRenderer::getTextWidth(const int fontId, const char* text, const EpdFontF
   std::string visual;
   const char* renderedText = resolveVisualText(text, visual, baseDir);
 
-  int w = 0, h = 0;
-  fontIt->second.getTextDimensions(renderedText, &w, &h, style);
-  return w;
+  // Mirror drawText()'s glyph walk so measurement honors the UI->CJK fallback.
+  // Delegating to EpdFontFamily::getTextDimensions would bypass resolveGlyph and
+  // under-measure any line containing fallback (CJK) glyphs, clipping titles.
+  const auto& font = fontIt->second;
+  const char* textCursor = renderedText;
+  uint32_t cp;
+  uint32_t prevCp = 0;
+  int widthPx = 0;
+  int32_t prevAdvanceFP = 0;  // 12.4 fixed-point: prev glyph's advance + next kern for snap
+  while ((cp = utf8NextCodepoint(reinterpret_cast<const uint8_t**>(&textCursor)))) {
+    // Skip Hebrew Niqqud and combining marks — they add no advance (match drawText).
+    if (cp >= 0x0591 && cp <= 0x05C7) continue;
+    if (utf8IsCombiningMark(cp)) continue;
+
+    cp = font.applyLigatures(cp, textCursor, style);
+
+    // Differential rounding: snap (previous advance + current kern) together so
+    // measurement and drawText agree to the pixel.
+    if (prevCp != 0) {
+      const auto kernFP = font.getKerning(prevCp, cp, style);  // 4.4 fixed-point kern
+      widthPx += fp4::toPixel(prevAdvanceFP + kernFP);
+    }
+
+    // Resolve once; read advance then discard before the next resolve.
+    const ResolvedGlyph resolved = resolveGlyph(font, cp, style);
+    prevAdvanceFP = resolved.glyph ? resolved.glyph->advanceX : 0;
+    if ((style & (EpdFontFamily::SUP | EpdFontFamily::SUB)) != 0) {
+      prevAdvanceFP = (prevAdvanceFP + 1) / 2;
+    }
+    prevCp = cp;
+  }
+  widthPx += fp4::toPixel(prevAdvanceFP);  // final glyph's advance
+  return widthPx;
 }
 
 void GfxRenderer::drawCenteredText(const int fontId, const int y, const char* text, const bool black,
@@ -425,12 +480,15 @@ void GfxRenderer::drawText(const int fontId, const int x, const int y, const cha
     }
 
     if (utf8IsCombiningMark(cp)) {
+      // Combining marks stay on the primary font (intentionally not routed
+      // through the CJK fallback).
       const EpdGlyph* combiningGlyph = font.getGlyph(cp, style);
       if (!combiningGlyph) continue;
       const int raiseBy = combiningMark::raiseAboveBase(combiningGlyph->top, combiningGlyph->height, lastBaseTop);
       const int combiningX = combiningMark::centerOver(lastBaseX, lastBaseLeft, lastBaseWidth, combiningGlyph->left,
                                                        combiningGlyph->width);
-      renderCharImpl<TextRotation::None>(*this, renderMode, font, cp, combiningX, yPos - raiseBy, black, style);
+      renderCharImpl<TextRotation::None>(*this, renderMode, combiningGlyph, font.getData(style), combiningX,
+                                         yPos - raiseBy, black);
       continue;
     }
 
@@ -444,7 +502,11 @@ void GfxRenderer::drawText(const int fontId, const int x, const int y, const cha
       lastBaseX += fp4::toPixel(prevAdvanceFP + kernFP);       // snap 12.4 fixed-point to nearest pixel
     }
 
-    const EpdGlyph* glyph = font.getGlyph(cp, style);
+    // Resolve once: glyph + its source font data (primary, CJK fallback, or
+    // replacement). Must be consumed (drawn) before the next resolveGlyph call,
+    // which can evict an SD fallback glyph from the overflow ring.
+    const ResolvedGlyph resolved = resolveGlyph(font, cp, style);
+    const EpdGlyph* glyph = resolved.glyph;
 
     lastBaseLeft = glyph ? glyph->left : 0;
     lastBaseWidth = glyph ? glyph->width : 0;
@@ -460,9 +522,9 @@ void GfxRenderer::drawText(const int fontId, const int x, const int y, const cha
 
     if (isSupSub) {
       // yPos already carries the vertical offset applied by TextBlock::render().
-      renderCharScaled(*this, renderMode, font, cp, lastBaseX, yPos, black, style);
+      renderCharScaled(*this, renderMode, glyph, resolved.sourceFontData, lastBaseX, yPos, black);
     } else {
-      renderCharImpl<TextRotation::None>(*this, renderMode, font, cp, lastBaseX, yPos, black, style);
+      renderCharImpl<TextRotation::None>(*this, renderMode, glyph, resolved.sourceFontData, lastBaseX, yPos, black);
     }
     prevCp = cp;
   }
@@ -1478,8 +1540,9 @@ int GfxRenderer::getTextAdvanceX(const int fontId, const char* text, EpdFontFami
       widthPx += fp4::toPixel(prevAdvanceFP + kernFP);         // snap 12.4 fixed-point to nearest pixel
     }
 
-    const EpdGlyph* glyph = font.getGlyph(cp, style);
-    prevAdvanceFP = glyph ? glyph->advanceX : 0;
+    // Resolve once (primary / CJK fallback / replacement); consume before next.
+    const ResolvedGlyph resolved = resolveGlyph(font, cp, style);
+    prevAdvanceFP = resolved.glyph ? resolved.glyph->advanceX : 0;
     if ((style & (EpdFontFamily::SUP | EpdFontFamily::SUB)) != 0) {
       prevAdvanceFP = (prevAdvanceFP + 1) / 2;
     }
@@ -1549,13 +1612,15 @@ void GfxRenderer::drawTextRotated90CW(const int fontId, const int x, const int y
     }
 
     if (utf8IsCombiningMark(cp)) {
+      // Combining marks stay on the primary font (not routed through fallback).
       const EpdGlyph* combiningGlyph = font.getGlyph(cp, style);
       if (!combiningGlyph) continue;
       const int raiseBy = combiningMark::raiseAboveBase(combiningGlyph->top, combiningGlyph->height, lastBaseTop);
       const int combiningX = x - raiseBy;
       const int combiningY = combiningMark::centerOverRotated90CW(lastBaseY, lastBaseLeft, lastBaseWidth,
                                                                   combiningGlyph->left, combiningGlyph->width);
-      renderCharImpl<TextRotation::Rotated90CW>(*this, renderMode, font, cp, combiningX, combiningY, black, style);
+      renderCharImpl<TextRotation::Rotated90CW>(*this, renderMode, combiningGlyph, font.getData(style), combiningX,
+                                                combiningY, black);
       continue;
     }
 
@@ -1568,14 +1633,16 @@ void GfxRenderer::drawTextRotated90CW(const int fontId, const int x, const int y
       lastBaseY -= fp4::toPixel(prevAdvanceFP + kernFP);       // snap 12.4 fixed-point to nearest pixel
     }
 
-    const EpdGlyph* glyph = font.getGlyph(cp, style);
+    // Resolve once (primary / CJK fallback / replacement); consume before next.
+    const ResolvedGlyph resolved = resolveGlyph(font, cp, style);
+    const EpdGlyph* glyph = resolved.glyph;
 
     lastBaseLeft = glyph ? glyph->left : 0;
     lastBaseWidth = glyph ? glyph->width : 0;
     lastBaseTop = glyph ? glyph->top : 0;
     prevAdvanceFP = glyph ? glyph->advanceX : 0;  // 12.4 fixed-point
 
-    renderCharImpl<TextRotation::Rotated90CW>(*this, renderMode, font, cp, x, lastBaseY, black, style);
+    renderCharImpl<TextRotation::Rotated90CW>(*this, renderMode, glyph, resolved.sourceFontData, x, lastBaseY, black);
     prevCp = cp;
   }
 }

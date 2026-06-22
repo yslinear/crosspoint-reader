@@ -74,6 +74,27 @@ class GfxRenderer {
   mutable int _stripRows = 0;
   mutable bool _stripActive = false;
 
+  // UI->CJK glyph fallback. When non-zero, identifies an SD-card font family
+  // (registered in fontMap/sdCardFonts_) consulted for any codepoint the
+  // primary UI font lacks. 0 = no fallback (every miss draws the primary's
+  // replacement glyph, the historic behavior). 4 bytes, no allocation.
+  int uiFallbackFontId_ = 0;
+
+  // Result of resolving one codepoint to a concrete glyph + the font data it
+  // belongs to. glyph and sourceFontData MUST stay paired: getGlyphBitmap()
+  // and the is2Bit/ascender reads index into sourceFontData, so a glyph from
+  // one font with another font's data yields garbage / misaligned reads.
+  struct ResolvedGlyph {
+    const EpdGlyph* glyph;
+    const EpdFontData* sourceFontData;
+  };
+  // Resolve cp against `primary`, falling back to the UI fallback font when the
+  // primary lacks the glyph, and finally to the primary's replacement glyph.
+  // CRITICAL: an SD fallback glyph pointer is into the overflow ring and is
+  // invalidated by the NEXT resolve. Callers must fully consume (measure or
+  // draw) one ResolvedGlyph before resolving the next; never hold two.
+  ResolvedGlyph resolveGlyph(const EpdFontFamily& primary, uint32_t cp, EpdFontFamily::Style style) const;
+
   void renderChar(const EpdFontFamily& fontFamily, uint32_t cp, int* x, int* y, bool pixelState,
                   EpdFontFamily::Style style) const;
   void freeBwBufferChunks();
@@ -111,6 +132,10 @@ class GfxRenderer {
   void clearSdCardFonts() { sdCardFonts_.clear(); }
   const std::map<int, SdCardFont*>& getSdCardFonts() const { return sdCardFonts_; }
   bool isSdCardFont(int fontId) const { return sdCardFonts_.count(fontId) > 0; }
+  // UI->CJK glyph fallback font (an SD-card CJK font registered like any other).
+  // Set to 0 to disable. See uiFallbackFontId_ and resolveGlyph().
+  void setUiFallbackFont(int id) { uiFallbackFontId_ = id; }
+  int getUiFallbackFontId() const { return uiFallbackFontId_; }
   // Ensure SD card font glyph data is loaded for the given text. Called from layout code
   // (which holds a const GfxRenderer&) before measuring word widths. Safe to call on non-SD fonts (no-op).
   // styleMask: bitmask of styles to prepare (bit 0=regular, 1=bold, 2=italic, 3=bold-italic).

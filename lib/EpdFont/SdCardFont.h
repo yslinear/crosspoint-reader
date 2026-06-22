@@ -23,7 +23,11 @@ class SdCardFont {
   static constexpr uint16_t MAX_PAGE_GLYPHS = 512;
   static constexpr uint8_t MAX_STYLES = 4;
 
-  SdCardFont() = default;
+  // overflowCapacity: number of on-demand glyph slots in the per-instance
+  // overflow ring. Default 8 keeps existing reader-body callers byte-identical.
+  // The UI->CJK fallback instance passes a larger value (~64) so a long Han
+  // title doesn't evict-and-refetch from SD on every e-ink redraw.
+  explicit SdCardFont(uint32_t overflowCapacity = DEFAULT_OVERFLOW_CAPACITY);
   ~SdCardFont();
   // Owns raw buffers freed in dtor — no shallow-copy semantics. Make any
   // accidental pass-by-value or move a compile-time error.
@@ -203,15 +207,22 @@ class SdCardFont {
   };
   OverflowContext overflowCtx_[MAX_STYLES] = {};
 
-  // Shared on-demand overflow buffer (ring buffer of glyphs loaded via glyphMissHandler)
-  static constexpr uint32_t OVERFLOW_CAPACITY = 8;
+  // On-demand overflow buffer (ring buffer of glyphs loaded via glyphMissHandler).
+  // Capacity is per-instance (overflowCapacity_, set in the constructor) so the
+  // UI fallback can size a larger ring without inflating reader-body fonts.
+  static constexpr uint32_t DEFAULT_OVERFLOW_CAPACITY = 8;
   struct OverflowEntry {
     EpdGlyph glyph;
     uint8_t* bitmap = nullptr;
     uint32_t codepoint = 0;
     uint8_t styleIdx = 0;
   };
-  OverflowEntry overflow_[OVERFLOW_CAPACITY] = {};
+  // Heap-allocated ring of overflowCapacity_ entries (allocated in the
+  // constructor, freed in the destructor). Sized once at construction; a single
+  // OverflowEntry is 24 bytes, so the default 8-slot ring is 192 bytes and a
+  // 64-slot UI-fallback ring is ~1.5 KB — charged only when the fallback loads.
+  OverflowEntry* overflow_ = nullptr;
+  uint32_t overflowCapacity_ = DEFAULT_OVERFLOW_CAPACITY;
   uint32_t overflowCount_ = 0;
   uint32_t overflowNext_ = 0;
 

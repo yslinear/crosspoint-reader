@@ -70,7 +70,24 @@ const char* asCStr(const char* s) { return s; }
 
 }  // namespace
 
-SdCardFont::~SdCardFont() { freeAll(); }
+SdCardFont::SdCardFont(uint32_t overflowCapacity) {
+  // Allocate the per-instance overflow ring once. A capacity of 0 is degenerate
+  // (every miss returns nullptr), so clamp to at least 1. On OOM, fall back to a
+  // 0-length ring: overflowCapacity_ stays describing the failure, overflow_ is
+  // null, and onGlyphMiss() must guard against a null ring (it does).
+  overflowCapacity_ = overflowCapacity > 0 ? overflowCapacity : 1;
+  overflow_ = new (std::nothrow) OverflowEntry[overflowCapacity_]();
+  if (!overflow_) {
+    LOG_ERR("SDCF", "Failed to allocate overflow ring (%u entries)", overflowCapacity_);
+    overflowCapacity_ = 0;
+  }
+}
+
+SdCardFont::~SdCardFont() {
+  freeAll();
+  delete[] overflow_;
+  overflow_ = nullptr;
+}
 
 // --- Per-style free/cleanup ---
 
@@ -1296,6 +1313,8 @@ const EpdGlyph* SdCardFont::onGlyphMiss(void* ctx, uint32_t codepoint) {
   uint8_t styleIdx = oc->styleIdx;
 
   if (!self->loaded_ || styleIdx >= MAX_STYLES || !self->styles_[styleIdx].present) return nullptr;
+  // A null ring (allocation failed in the constructor) cannot serve any glyph.
+  if (!self->overflow_ || self->overflowCapacity_ == 0) return nullptr;
   const auto& s = self->styles_[styleIdx];
   if (!s.fullIntervals && !s.bmpIntervals) return nullptr;
 
@@ -1314,7 +1333,7 @@ const EpdGlyph* SdCardFont::onGlyphMiss(void* ctx, uint32_t codepoint) {
   // existing slot stays valid if SD I/O fails. Bookkeeping (count/next)
   // is deferred until after all I/O succeeds to avoid inconsistent state.
   uint32_t slot = self->overflowNext_;
-  bool wasAtCapacity = (self->overflowCount_ == OVERFLOW_CAPACITY);
+  bool wasAtCapacity = (self->overflowCount_ == self->overflowCapacity_);
 
   // Read glyph metadata into temporary
   HalFile file;
@@ -1362,14 +1381,14 @@ const EpdGlyph* SdCardFont::onGlyphMiss(void* ctx, uint32_t codepoint) {
   } else {
     self->overflowCount_++;
   }
-  self->overflowNext_ = (slot + 1) % OVERFLOW_CAPACITY;
+  self->overflowNext_ = (slot + 1) % self->overflowCapacity_;
   self->overflow_[slot].glyph = tempGlyph;
   self->overflow_[slot].bitmap = tempBitmap;
   self->overflow_[slot].codepoint = codepoint;
   self->overflow_[slot].styleIdx = styleIdx;
 
   LOG_DBG("SDCF", "Overflow: loaded U+%04X style %u on demand (slot %u/%u)", codepoint, styleIdx, slot,
-          OVERFLOW_CAPACITY);
+          self->overflowCapacity_);
 
   return &self->overflow_[slot].glyph;
 }
