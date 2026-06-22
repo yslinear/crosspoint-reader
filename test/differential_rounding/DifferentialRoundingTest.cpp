@@ -191,6 +191,30 @@ TEST(EpdFont, GlyphLookup) {
   EXPECT_EQ(testFont().getGlyph('b'), nullptr);
 }
 
+TEST(EpdFont, TryGetGlyphMissReturnsNullWithoutSubstitution) {
+  // Hit: tryGetGlyph() returns the same glyph pointer as getGlyph().
+  EXPECT_EQ(testFont().tryGetGlyph('T'), testFont().getGlyph('T'));
+  EXPECT_NE(testFont().tryGetGlyph('o'), nullptr);
+
+  // The whole point of tryGetGlyph() is the UI->CJK fallback probe: on a miss it
+  // must return nullptr instead of substituting the replacement glyph, so the
+  // caller can tell "this font covers cp" from "it doesn't". Build a font that
+  // DOES carry a U+FFFD replacement to show the divergence from getGlyph().
+  static const EpdUnicodeInterval kReplIntervals[] = {
+      {0x54, 0x54, 0}, {0x61, 0x61, 1}, {0x6F, 0x6F, 2}, {0x78, 0x78, 3}, {0xFFFD, 0xFFFD, 3}};
+  EpdFontData replData = kTestFontData;
+  replData.intervals = kReplIntervals;
+  replData.intervalCount = 5;
+  EpdFont replFont(&replData);
+
+  // getGlyph() substitutes U+FFFD on a miss; tryGetGlyph() does not.
+  EXPECT_EQ(replFont.getGlyph('Z'), replFont.getGlyph(0xFFFD));
+  EXPECT_NE(replFont.getGlyph('Z'), nullptr);
+  EXPECT_EQ(replFont.tryGetGlyph('Z'), nullptr);
+  // A covered codepoint still resolves through tryGetGlyph().
+  EXPECT_EQ(replFont.tryGetGlyph('T'), replFont.getGlyph('T'));
+}
+
 // Known-value regression tests.  Expected widths are computed by hand using
 // differential rounding.  If someone reverts to absolute snapping, specific
 // test cases will fail.
