@@ -146,6 +146,14 @@ families:
       italic:     {path: "builtinFonts/source/NotoSans/NotoSans-Italic.ttf"}
       bolditalic: {path: "builtinFonts/source/NotoSans/NotoSans-BoldItalic.ttf"}
 
+  - name: NotoSansTC
+    description: "Traditional Chinese sans-serif (CJK + Latin)"
+    intervals: latin-ext,cjk
+    sizes: [12, 14, 16, 18]
+    styles:
+      regular: {path: "builtinFonts/source/NotoSansTC/NotoSansTC-Regular.ttf"}
+      bold:    {path: "builtinFonts/source/NotoSansTC/NotoSansTC-Bold.ttf"}
+
   - name: Inter
     description: "Modern sans-serif (Latin, Greek, Cyrillic)"
     intervals: latin-ext,greek,cyrillic
