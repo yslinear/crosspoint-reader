@@ -29,6 +29,21 @@ int findCurrentFontIndex(const SdCardFontRegistry* registry, const char* sdFontF
 
   return fontFamily < CrossPointSettings::BUILTIN_FONT_COUNT ? fontFamily : 0;
 }
+
+// Insert a space at each lowercase->uppercase boundary so an SD font's folder
+// name (e.g. "NotoSansTC") displays like the built-in labels ("Noto Sans TC").
+// Display only: selection/matching and the SD-card folder keep the raw name.
+std::string prettifyFontName(const std::string& raw) {
+  std::string out;
+  out.reserve(raw.size() + 4);
+  for (size_t i = 0; i < raw.size(); i++) {
+    const char c = raw[i];
+    const char prev = i > 0 ? raw[i - 1] : '\0';
+    if (c >= 'A' && c <= 'Z' && prev >= 'a' && prev <= 'z') out += ' ';
+    out += c;
+  }
+  return out;
+}
 }  // namespace
 
 FontSelectionActivity::FontSelectionActivity(GfxRenderer& renderer, MappedInputManager& mappedInput,
@@ -58,12 +73,20 @@ void FontSelectionActivity::onEnter() {
   if (registry_) {
     const auto& families = registry_->getFamilies();
     for (int i = 0; i < static_cast<int>(families.size()); i++) {
-      fonts_.push_back({families[i].name, false, static_cast<uint8_t>(CrossPointSettings::BUILTIN_FONT_COUNT + i)});
+      fonts_.push_back(
+          {prettifyFontName(families[i].name), false, static_cast<uint8_t>(CrossPointSettings::BUILTIN_FONT_COUNT + i)});
     }
   }
 
   selectedIndex_ = findCurrentFontIndex(registry_, SETTINGS.sdFontFamilyName, SETTINGS.fontFamily);
   previewFontIndex_ = selectedIndex_;
+
+  // Load the SD reader font for the current settings before the first preview
+  // render. Otherwise getReaderFontId() resolves to 0 (family not loaded) and
+  // falls through to a Latin builtin, so a CJK SD font's preview text renders as
+  // tofu until the user navigates. Mirrors ReaderActivity::onEnter; unconditional
+  // so it also reconciles the manager after a web-upload font change.
+  sdFontSystem.ensureLoaded(renderer);
 
   requestUpdate();
 }
