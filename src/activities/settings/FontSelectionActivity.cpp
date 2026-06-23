@@ -29,21 +29,6 @@ int findCurrentFontIndex(const SdCardFontRegistry* registry, const char* sdFontF
 
   return fontFamily < CrossPointSettings::BUILTIN_FONT_COUNT ? fontFamily : 0;
 }
-
-// Insert a space at each lowercase->uppercase boundary so an SD font's folder
-// name (e.g. "NotoSansTC") displays like the built-in labels ("Noto Sans TC").
-// Display only: selection/matching and the SD-card folder keep the raw name.
-std::string prettifyFontName(const std::string& raw) {
-  std::string out;
-  out.reserve(raw.size() + 4);
-  for (size_t i = 0; i < raw.size(); i++) {
-    const char c = raw[i];
-    const char prev = i > 0 ? raw[i - 1] : '\0';
-    if (c >= 'A' && c <= 'Z' && prev >= 'a' && prev <= 'z') out += ' ';
-    out += c;
-  }
-  return out;
-}
 }  // namespace
 
 FontSelectionActivity::FontSelectionActivity(GfxRenderer& renderer, MappedInputManager& mappedInput,

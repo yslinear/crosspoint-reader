@@ -23,6 +23,22 @@ struct SdCardFontFamilyInfo {
   std::vector<uint8_t> availableSizes() const;
 };
 
+// Pretty-print a raw SD font family (directory) name for DISPLAY, inserting a
+// space at each lowercase->uppercase boundary so "NotoSansTC" shows as
+// "Noto Sans TC" (matching the built-in font labels). Display only — the raw
+// name is still used for selection/matching and the SD-card folder/path.
+inline std::string prettifyFontName(const std::string& raw) {
+  std::string out;
+  out.reserve(raw.size() + 4);
+  for (size_t i = 0; i < raw.size(); i++) {
+    const char c = raw[i];
+    const char prev = i > 0 ? raw[i - 1] : '\0';
+    if (c >= 'A' && c <= 'Z' && prev >= 'a' && prev <= 'z') out += ' ';
+    out += c;
+  }
+  return out;
+}
+
 class SdCardFontRegistry {
  public:
   static constexpr int MAX_SD_FAMILIES = 128;
