@@ -90,11 +90,10 @@ void HomeActivity::loadRecentCovers(int coverHeight) {
               popupRect = GUI.drawPopup(renderer, tr(STR_LOADING_POPUP));
             }
             GUI.fillPopupProgress(renderer, popupRect, 10 + progress * (90 / recentBooks.size()));
-            bool success = xtc.generateThumbBmp(coverHeight);
-            if (!success) {
-              RECENT_BOOKS.updateBook(book.path, book.title, book.author, "");
-              book.coverBmpPath = "";
-            }
+            // On failure (e.g. a transient low-heap moment) leave coverBmpPath
+            // intact so the next Home entry retries. Persisting an empty path
+            // here would permanently suppress the cover.
+            xtc.generateThumbBmp(coverHeight);
             coverRendered = false;
             requestUpdate();
           }

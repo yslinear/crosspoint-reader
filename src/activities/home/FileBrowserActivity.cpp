@@ -325,6 +325,9 @@ void FileBrowserActivity::loop() {
 }
 
 std::string getFileName(std::string filename) {
+  if (filename.empty()) {
+    return "";
+  }
   if (filename.back() == '/') {
     filename.pop_back();
     if (!UITheme::getInstance().getTheme().showsFileIcons()) {
@@ -337,11 +340,13 @@ std::string getFileName(std::string filename) {
 }
 
 std::string getFileExtension(std::string filename) {
-  if (filename.back() == '/') {
+  // A dotless name yields rfind == npos; substr(npos) throws std::out_of_range,
+  // which aborts under -fno-exceptions. Guard both that and an empty name.
+  if (filename.empty() || filename.back() == '/') {
     return "";
   }
   const auto pos = filename.rfind('.');
-  return filename.substr(pos);
+  return pos == std::string::npos ? "" : filename.substr(pos);
 }
 
 void FileBrowserActivity::render(RenderLock&&) {
