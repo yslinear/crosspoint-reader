@@ -58,6 +58,22 @@ class XtcParser {
   size_t loadPage(uint32_t pageIndex, uint8_t* buffer, size_t bufferSize);
 
   /**
+   * Load a contiguous region of a page's bitmap data (after the page header).
+   *
+   * Enables band rendering without holding the whole page resident. Only valid
+   * for uncompressed pages (compression == 0); fails with INVALID_MAGIC if the
+   * page is compressed. The region is addressed relative to the start of the
+   * bitmap data (i.e. excluding the XTG/XTH header).
+   *
+   * @param pageIndex Page index (0-based)
+   * @param bitmapOffset Byte offset into the bitmap data
+   * @param buffer Output buffer (caller allocated, >= length bytes)
+   * @param length Number of bytes to read
+   * @return Number of bytes read on success, 0 on failure
+   */
+  size_t loadPageRegion(uint32_t pageIndex, size_t bitmapOffset, uint8_t* buffer, size_t length);
+
+  /**
    * Streaming page load
    * Memory-efficient method that reads page data in chunks.
    *
