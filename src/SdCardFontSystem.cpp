@@ -61,11 +61,12 @@ void SdCardFontSystem::loadUiFallback(GfxRenderer& renderer) {
   // at 0, so non-CJK users pay zero RAM (no SdCardFont, no overflow ring).
   static constexpr char kFallbackFamily[] = "NotoSansTC";
   static constexpr uint8_t kFallbackPointSize = 12;
-  // ~64-slot overflow ring: a long Han title (book/chapter names) can touch
-  // dozens of unique glyphs in one redraw. The default 8-slot ring would
-  // evict-and-refetch from SD on every e-ink update; 64 covers a typical title
-  // in one pass. ~24 bytes/slot => ~1.5 KB, charged only when CJK is installed.
-  static constexpr uint32_t kFallbackOverflowCapacity = 64;
+  // ~256-slot overflow ring: a full file-browser page can show ~100 unique Han
+  // glyphs across all visible filenames in one redraw. The default 8-slot ring
+  // would evict-and-refetch from SD on every e-ink update, and even 64 thrashes
+  // on a dense page; 256 covers a typical page in one pass. ~24 bytes/slot =>
+  // ~6 KB, charged only when CJK is installed.
+  static constexpr uint32_t kFallbackOverflowCapacity = 256;
 
   const auto* family = registry_.findFamily(kFallbackFamily);
   if (!family) return;

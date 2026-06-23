@@ -1,5 +1,6 @@
 #include "ImageBlock.h"
 
+#include <BufferedHalReader.h>
 #include <FontCacheManager.h>
 #include <GfxRenderer.h>
 #include <HalSystem.h>
@@ -209,7 +210,8 @@ bool ImageBlock::serialize(HalFile& file) {
   return true;
 }
 
-std::unique_ptr<ImageBlock> ImageBlock::deserialize(HalFile& file) {
+template <typename Reader>
+std::unique_ptr<ImageBlock> ImageBlock::deserialize(Reader& file) {
   std::string path;
   serialization::readString(file, path);
   int16_t w, h;
@@ -217,3 +219,7 @@ std::unique_ptr<ImageBlock> ImageBlock::deserialize(HalFile& file) {
   serialization::readPod(file, h);
   return std::unique_ptr<ImageBlock>(new ImageBlock(path, w, h));
 }
+
+// Explicit instantiations (one binary copy per reader type, in this TU).
+template std::unique_ptr<ImageBlock> ImageBlock::deserialize<HalFile>(HalFile&);
+template std::unique_ptr<ImageBlock> ImageBlock::deserialize<BufferedHalReader>(BufferedHalReader&);

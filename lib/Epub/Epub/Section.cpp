@@ -1,5 +1,6 @@
 #include "Section.h"
 
+#include <BufferedHalReader.h>
 #include <HalStorage.h>
 #include <HalSystem.h>
 #include <Logging.h>
@@ -342,7 +343,14 @@ std::unique_ptr<Page> Section::loadPageFromSectionFile() {
   serialization::readPod(file, pagePos);
   file.seek(pagePos);
 
-  auto page = Page::deserialize(file);
+  // Wrap the positioned file in a forward buffer for the page read. Page data is
+  // streamed purely forward from pagePos via dozens of tiny POD/string reads;
+  // buffering collapses those per-read storage-mutex+SdFat round-trips into a few
+  // 4 KiB block reads. On-disk byte order is unchanged. The buffer is transient,
+  // scoped to this call, and freed at return (or never allocated on OOM, in which
+  // case BufferedHalReader transparently passes reads through to `file`).
+  BufferedHalReader reader(file);
+  auto page = Page::deserialize(reader);
   // Explicit close() required: member variable persists beyond function scope
   file.close();
   return page;

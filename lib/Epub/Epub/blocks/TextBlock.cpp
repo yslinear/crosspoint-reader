@@ -1,6 +1,7 @@
 #include "TextBlock.h"
 
 #include <BidiUtils.h>
+#include <BufferedHalReader.h>
 #include <GfxRenderer.h>
 #include <Logging.h>
 #include <Serialization.h>
@@ -118,7 +119,8 @@ bool TextBlock::serialize(HalFile& file) const {
   return true;
 }
 
-std::unique_ptr<TextBlock> TextBlock::deserialize(HalFile& file) {
+template <typename Reader>
+std::unique_ptr<TextBlock> TextBlock::deserialize(Reader& file) {
   uint16_t wc;
   std::vector<std::string> words;
   std::vector<int16_t> wordXpos;
@@ -174,3 +176,9 @@ std::unique_ptr<TextBlock> TextBlock::deserialize(HalFile& file) {
                                                   std::move(wordFocusBoundary), std::move(wordFocusSuffixX),
                                                   blockStyle));
 }
+
+// Explicit instantiations: one binary copy per reader type, here in this TU,
+// instead of re-instantiating in every TU that calls deserialize(). Keeps the
+// flash cost of templatization bounded (CLAUDE.md template-bloat guidance).
+template std::unique_ptr<TextBlock> TextBlock::deserialize<HalFile>(HalFile&);
+template std::unique_ptr<TextBlock> TextBlock::deserialize<BufferedHalReader>(BufferedHalReader&);
