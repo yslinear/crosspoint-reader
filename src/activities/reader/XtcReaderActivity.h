@@ -28,6 +28,11 @@ class XtcReaderActivity final : public Activity {
   };
 
   void renderPage();
+  // Band-renders a 2-bit (XTH) page without a full-page buffer, streaming one
+  // horizontal band at a time. Returns false (caller falls back to the
+  // whole-page path) if banding does not apply or its small buffers fail to
+  // allocate. Precondition: bitDepth == 2.
+  bool renderPage2BitBanded(uint16_t pageWidth, uint16_t pageHeight);
   void renderStatusBarOverlay(StatusBarOverlayPosition position) const;
   StatusBarInfo getStatusBarInfo() const;
   void saveProgress() const;
