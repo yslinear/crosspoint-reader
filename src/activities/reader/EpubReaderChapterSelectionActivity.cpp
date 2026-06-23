@@ -21,6 +21,19 @@ void EpubReaderChapterSelectionActivity::onEnter() {
     selectorIndex = 0;
   }
 
+  // Read every TOC label from book.bin ONCE and cache the indented strings in
+  // RAM. getTocItem() does 2 SD seeks + string reads per call, and the list
+  // renderer requests every visible item on every navigation — reading on each
+  // render made paging slow. After this, navigation renders purely from RAM.
+  const int count = epub->getTocItemsCount();
+  tocDisplay_.clear();
+  tocDisplay_.reserve(count);
+  for (int i = 0; i < count; i++) {
+    const auto item = epub->getTocItem(i);
+    const size_t indent = item.level > 0 ? static_cast<size_t>(item.level - 1) * 2 : 0;
+    tocDisplay_.push_back(std::string(indent, ' ') + item.title);
+  }
+
   // Trigger first update
   requestUpdate();
 }
@@ -84,10 +97,11 @@ void EpubReaderChapterSelectionActivity::render(RenderLock&&) {
 
   const int totalItems = getTotalItems();
   GUI.drawList(renderer, Rect{screen.x, contentTop, screen.width, contentHeight}, totalItems, selectorIndex,
-               [this](int index) {
-                 auto item = epub->getTocItem(index);
-                 std::string indent((item.level - 1) * 2, ' ');
-                 return indent + item.title;
+               [this](int index) -> std::string {
+                 if (index >= 0 && index < static_cast<int>(tocDisplay_.size())) {
+                   return tocDisplay_[index];
+                 }
+                 return "";
                });
 
   const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_SELECT), tr(STR_DIR_UP), tr(STR_DIR_DOWN));
