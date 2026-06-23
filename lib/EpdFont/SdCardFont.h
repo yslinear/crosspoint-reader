@@ -92,10 +92,15 @@ class SdCardFont {
   // Returns true if advance table is populated for at least one style.
   bool hasAdvanceTable() const;
 
-  // Free mini data for all styles and restore stub EpdFontData.
-  // Preserves the persistent advance cache so repeated layout passes can reuse
-  // previously fetched metrics.
+  // Free mini data for all styles and restore stub EpdFontData. Also wipes the
+  // on-demand overflow ring. Preserves the persistent advance cache so repeated
+  // layout passes can reuse previously fetched metrics.
   void clearCache();
+
+  // Free per-page prewarm mini-data ONLY, preserving the on-demand overflow ring
+  // (shared UI/file-browser CJK glyph cache) and the advance cache. Use on a
+  // reader exit where the prewarm must be released but the UI cache must survive.
+  void clearPrewarm();
 
   // Drop the persistent advance cache. Call when unloading the SD font or
   // when font/size/family/glyph-table state changes.

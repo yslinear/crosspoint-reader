@@ -201,10 +201,13 @@ void EpubReaderActivity::onExit() {
   // book/session (a cross-session leak). onExit runs under the global RenderLock
   // (ActivityManager::exitActivity), and cancelAll() above has already asked the
   // in-flight prewarm to abort, so this clear is race-free against the worker.
-  // clearCache() frees the mini-bitmaps; releasePrewarmHeld() drops the worker's
+  // clearPrewarm() frees the prewarm mini-bitmaps but PRESERVES the SD fonts'
+  // on-demand overflow rings — those cache UI / file-browser CJK glyphs, and the
+  // old clearCache() here wiped them, leaving CJK file lists cold and very slow
+  // after every reading session. releasePrewarmHeld() drops the worker's
   // held-byte accounting so kMaxHeldBytes starts the next session from zero.
   if (auto* fcm = renderer.getFontCacheManager()) {
-    fcm->clearCache();
+    fcm->clearPrewarm();
   }
   BG_WORKER.releasePrewarmHeld();
 

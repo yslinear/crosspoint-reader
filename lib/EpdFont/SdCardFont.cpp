@@ -1099,9 +1099,16 @@ int SdCardFont::prewarmStyle(uint8_t styleIdx, const uint32_t* codepoints, uint3
 
 void SdCardFont::clearCache() {
   clearOverflow();
-  // Note: advance table is intentionally preserved here. It persists across
-  // layout passes so repeated section indexing amortizes SD reads. Use
-  // clearPersistentCache() to wipe it.
+  clearPrewarm();
+}
+
+void SdCardFont::clearPrewarm() {
+  // Free per-page prewarm mini-data ONLY. Unlike clearCache(), this does NOT
+  // wipe the on-demand overflow ring: that ring caches UI / file-browser CJK
+  // glyphs and must survive a reader exit (clearing it left CJK file lists cold
+  // and very slow). The persistent advance cache is likewise preserved (it
+  // amortizes SD reads across repeated layout passes; use clearPersistentCache()
+  // to wipe it).
   for (uint8_t i = 0; i < MAX_STYLES; i++) {
     if (!styles_[i].present) continue;
     freeStyleMiniData(styles_[i]);
