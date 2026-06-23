@@ -1,9 +1,11 @@
 #include "ChapterHtmlSlimParser.h"
 
+#include <ErrorReport.h>
 #include <FsHelpers.h>
 #include <GfxRenderer.h>
 #include <HalStorage.h>
 #include <Logging.h>
+#include <Memory.h>
 #include <Utf8.h>
 #include <XmlParserUtils.h>
 #include <expat.h>
@@ -29,6 +31,12 @@ constexpr size_t PARSE_BUFFER_SIZE = 1024;
 // on resource-constrained devices (~380KB heap). TOC anchors bypass this cap.
 constexpr size_t MAX_ANCHORS_PER_CHAPTER = 1024;
 
+// Hard cap on XML element nesting depth. Once exceeded, the deeper subtree is
+// skipped (via skipUntilDepth) so the inline/block style stacks stop growing.
+// Generous so it never trips on a legitimate document; the real protection is
+// against malformed/adversarial markup on the ~380KB heap.
+constexpr int MAX_NESTING_DEPTH = 256;
+
 constexpr const char* HEADER_TAGS[] = {"h1", "h2", "h3", "h4", "h5", "h6"};
 constexpr const char* BLOCK_TAGS[] = {"p", "li", "div", "br", "blockquote"};
 constexpr const char* BOLD_TAGS[] = {"b", "strong"};
@@ -36,6 +44,20 @@ constexpr const char* ITALIC_TAGS[] = {"i", "em"};
 constexpr const char* UNDERLINE_TAGS[] = {"u", "ins"};
 constexpr const char* IMAGE_TAGS[] = {"img"};
 constexpr const char* SKIP_TAGS[] = {"head"};
+
+// Page elements (PageLine / PageImage / ImageBlock) live in a structural
+// std::shared_ptr graph (Page::elements). Converting them to makeUniqueNoThrow
+// would mean changing the shared_ptr container/serialize/render contract across
+// the codebase, which is out of scope for this change. make_shared aborts on OOM
+// under -fno-exceptions, so instead we PREFLIGHT the heap before each make_shared
+// of a small page element: if the largest contiguous block can't cover a small
+// element + control block, skip the element (truncate content) rather than abort.
+// These objects are tiny (<256 bytes incl. shared_ptr control block); the failure
+// mode we guard against is genuine heap exhaustion, not fragmentation of a large
+// contiguous buffer.
+constexpr size_t PAGE_ELEMENT_PREFLIGHT_BYTES = 512;
+
+bool canAllocPageElement() { return ESP.getMaxAllocHeap() >= PAGE_ELEMENT_PREFLIGHT_BYTES; }
 
 bool isWhitespace(const char c) { return c == ' ' || c == '\r' || c == '\n' || c == '\t'; }
 
@@ -149,7 +171,11 @@ void ChapterHtmlSlimParser::flushPendingAnchor() {
     if (currentPage && !currentPage->elements.empty()) {
       completePageFn(std::move(currentPage), xpathParagraphIndex, xpathListItemIndex);
       completedPageCount++;
-      currentPage.reset(new Page());
+      currentPage = makeUniqueNoThrow<Page>();
+      if (!currentPage) {
+        LOG_ERR_OOM("EHP", "Page", sizeof(Page));
+        return;
+      }
       currentPageNextY = 0;
     }
   }
@@ -185,9 +211,41 @@ void ChapterHtmlSlimParser::flushPartWordBuffer() {
 
   // flush the buffer
   partWordBuffer[partWordBufferIndex] = '\0';
+  if (!currentTextBlock) {
+    return;
+  }
   currentTextBlock->addWord(partWordBuffer, fontStyle, false, nextWordContinues);
   partWordBufferIndex = 0;
   nextWordContinues = false;
+}
+
+// If the current text block has accumulated more than TEXT_BLOCK_DRAIN_THRESHOLD
+// tokens, lay out and emit all completed lines, keeping the in-progress last line
+// (includeLastLine=false). This bounds the ParsedText token vectors to roughly
+// THRESHOLD + MAX_WORD_SIZE worth of tokens regardless of how long the incoming
+// Expat chunk is. Draining always cuts at completed line boundaries (the in-progress
+// last line is kept), and ParsedText::firstLineEmitted_ keeps the first-line indent on
+// the paragraph's true first line only. Layout is NOT byte-identical to a single
+// coarse drain, though: with the default (hyphenation-off) optimal line-break DP, a
+// finer drain horizon can shift breaks on >THRESHOLD-token paragraphs — the same
+// divergence class the old per-chunk multi-drain already had, now at finer cadence.
+// SECTION_FILE_VERSION was bumped so older caches regenerate.
+//
+// Spotted when reading Intermezzo, there are some really long text blocks in there.
+// Long unbroken CJK chunks hit the same path with thousands of per-char tokens, so
+// this must be called per completed word, not just once per chunk.
+void ChapterHtmlSlimParser::drainOversizedTextBlock() {
+  if (!currentTextBlock || currentTextBlock->size() <= TEXT_BLOCK_DRAIN_THRESHOLD) {
+    return;
+  }
+  LOG_DBG("EHP", "Text block too long, splitting into multiple pages");
+  const int horizontalInset = currentTextBlock->getBlockStyle().totalHorizontalInset();
+  const uint16_t effectiveWidth = (horizontalInset < viewportWidth)
+                                      ? static_cast<uint16_t>(viewportWidth - horizontalInset)
+                                      : viewportWidth;
+  currentTextBlock->layoutAndExtractLines(
+      renderer, fontId, effectiveWidth,
+      [this](const std::shared_ptr<TextBlock>& textBlock) { addLineToPage(textBlock); }, false);
 }
 
 // start a new text block if needed
@@ -213,7 +271,12 @@ void ChapterHtmlSlimParser::startNewTextBlock(const BlockStyle& blockStyle) {
   // If the pending anchor is a TOC chapter boundary, force a page break after the previous
   // block is flushed so the chapter starts on a fresh page.
   flushPendingAnchor();
-  currentTextBlock.reset(new ParsedText(extraParagraphSpacing, hyphenationEnabled, focusReadingEnabled, blockStyle));
+  currentTextBlock =
+      makeUniqueNoThrow<ParsedText>(extraParagraphSpacing, hyphenationEnabled, focusReadingEnabled, blockStyle);
+  if (!currentTextBlock) {
+    LOG_ERR("EHP", "OOM: ParsedText");
+    return;
+  }
   wordsExtractedInBlock = 0;
 }
 
@@ -284,6 +347,21 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
 
   // Middle of skip
   if (self->skipUntilDepth < self->depth) {
+    self->depth += 1;
+    return;
+  }
+
+  // Nesting cap: once we exceed the depth limit, skip this element's entire subtree
+  // using the existing skipUntilDepth machinery so no style/block stacks grow. Real
+  // EPUB/HTML content nests a few dozen levels deep at most; a runaway count means
+  // malformed or adversarial markup that would otherwise grow these stacks without
+  // bound (~380KB heap). The matching endElement clears the skip and balances depth.
+  if (self->depth >= MAX_NESTING_DEPTH) {
+    if (!self->depthCapReported) {
+      LOG_ERR("EHP", "Nesting depth cap hit (%d), skipping deeper subtree", MAX_NESTING_DEPTH);
+      self->depthCapReported = true;
+    }
+    self->skipUntilDepth = self->depth;
     self->depth += 1;
     return;
   }
@@ -634,14 +712,14 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
                   self->completePageFn(std::move(self->currentPage), self->xpathParagraphIndex,
                                        self->xpathListItemIndex);
                   self->completedPageCount++;
-                  self->currentPage.reset(new Page());
+                  self->currentPage = makeUniqueNoThrow<Page>();
                   if (!self->currentPage) {
                     LOG_ERR("EHP", "Failed to create new page");
                     return;
                   }
                   self->currentPageNextY = 0;
                 } else if (!self->currentPage) {
-                  self->currentPage.reset(new Page());
+                  self->currentPage = makeUniqueNoThrow<Page>();
                   if (!self->currentPage) {
                     LOG_ERR("EHP", "Failed to create initial page");
                     return;
@@ -652,18 +730,22 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
                 // Apply top margin from container block
                 self->currentPageNextY += imageMarginTop;
 
-                // Create ImageBlock and add to page
+                // Create ImageBlock and add to page.
+                // Preflight before each make_shared: make_shared aborts on OOM
+                // under -fno-exceptions, so the previous if(!ptr) null-checks were
+                // dead code (false safety). Skip the image element (truncate)
+                // rather than crash if the heap can't hold a small page element.
+                if (!canAllocPageElement()) {
+                  LOG_ERR_OOM("EHP", "ImageBlock", sizeof(ImageBlock));
+                  return;
+                }
                 auto imageBlock = std::make_shared<ImageBlock>(cachedImagePath, displayWidth, displayHeight);
-                if (!imageBlock) {
-                  LOG_ERR("EHP", "Failed to create ImageBlock");
-                  return;
-                }
                 int xPos = (self->viewportWidth - displayWidth) / 2;
-                auto pageImage = std::make_shared<PageImage>(imageBlock, xPos, self->currentPageNextY);
-                if (!pageImage) {
-                  LOG_ERR("EHP", "Failed to create PageImage");
+                if (!canAllocPageElement()) {
+                  LOG_ERR_OOM("EHP", "PageImage", sizeof(PageImage));
                   return;
                 }
+                auto pageImage = std::make_shared<PageImage>(imageBlock, xPos, self->currentPageNextY);
                 self->currentPage->elements.push_back(pageImage);
                 self->currentPageNextY += displayHeight + imageMarginBottom;
 
@@ -827,7 +909,9 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
       self->startNewTextBlock(accumulated.withoutBottom());
       self->updateEffectiveInlineStyle();
 
-      if (strcmp(name, "li") == 0) {
+      if (strcmp(name, "li") == 0 && self->currentTextBlock) {
+        // currentTextBlock can be null if startNewTextBlock() hit OOM (makeUniqueNoThrow);
+        // guard before dereferencing so a failed block degrades to a dropped bullet, not a crash.
         self->currentTextBlock->addWord("\xe2\x80\xa2", EpdFontFamily::REGULAR);
       }
     }
@@ -1106,21 +1190,16 @@ void XMLCALL ChapterHtmlSlimParser::characterData(void* userData, const XML_Char
     }
 
     self->partWordBuffer[self->partWordBufferIndex++] = s[i];
-  }
 
-  // If we have > 750 words buffered up, perform the layout and consume out all but the last line
-  // There should be enough here to build out 1-2 full pages and doing this will free up a lot of
-  // memory.
-  // Spotted when reading Intermezzo, there are some really long text blocks in there.
-  if (self->currentTextBlock->size() > 750) {
-    LOG_DBG("EHP", "Text block too long, splitting into multiple pages");
-    const int horizontalInset = self->currentTextBlock->getBlockStyle().totalHorizontalInset();
-    const uint16_t effectiveWidth = (horizontalInset < self->viewportWidth)
-                                        ? static_cast<uint16_t>(self->viewportWidth - horizontalInset)
-                                        : self->viewportWidth;
-    self->currentTextBlock->layoutAndExtractLines(
-        self->renderer, self->fontId, effectiveWidth,
-        [self](const std::shared_ptr<TextBlock>& textBlock) { self->addLineToPage(textBlock); }, false);
+    // Bound the token vectors per completed word, not just once per Expat chunk.
+    // A long unbroken CJK chunk completes a word on (almost) every iteration via
+    // the whitespace / no-break-space / MAX_WORD_SIZE flushes above; draining here
+    // keeps ParsedText's parallel vectors from growing to thousands of tokens and
+    // OOMing in a realloc. The helper's internal size<=THRESHOLD guard is an O(1)
+    // size() compare, so calling it every iteration is cheap. Drains cut only at
+    // completed line boundaries; see drainOversizedTextBlock() for the (intended,
+    // version-bumped) layout-divergence note on oversized paragraphs.
+    self->drainOversizedTextBlock();
   }
 }
 
@@ -1361,14 +1440,22 @@ void ChapterHtmlSlimParser::addLineToPage(std::shared_ptr<TextBlock> line) {
   const int lineHeight = renderer.getLineHeight(fontId) * lineCompression;
 
   if (!currentPage) {
-    currentPage.reset(new Page());
+    currentPage = makeUniqueNoThrow<Page>();
+    if (!currentPage) {
+      LOG_ERR_OOM("EHP", "Page", sizeof(Page));
+      return;
+    }
     currentPageNextY = 0;
   }
 
   if (currentPageNextY + lineHeight > viewportHeight) {
     completePageFn(std::move(currentPage), xpathParagraphIndex, xpathListItemIndex);
     completedPageCount++;
-    currentPage.reset(new Page());
+    currentPage = makeUniqueNoThrow<Page>();
+    if (!currentPage) {
+      LOG_ERR_OOM("EHP", "Page", sizeof(Page));
+      return;
+    }
     currentPageNextY = 0;
   }
 
@@ -1383,6 +1470,12 @@ void ChapterHtmlSlimParser::addLineToPage(std::shared_ptr<TextBlock> line) {
 
   // Apply horizontal left inset (margin + padding) as x position offset
   const int16_t xOffset = line->getBlockStyle().leftInset();
+  // Preflight: make_shared aborts on OOM under -fno-exceptions. Skip the line
+  // (truncate) rather than crash if the heap can't hold a small page element.
+  if (!canAllocPageElement()) {
+    LOG_ERR_OOM("EHP", "PageLine", sizeof(PageLine));
+    return;
+  }
   currentPage->elements.push_back(std::make_shared<PageLine>(line, xOffset, currentPageNextY));
   currentPageNextY += lineHeight;
 }

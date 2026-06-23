@@ -1,9 +1,12 @@
 #include "Epub.h"
 
+#include <ErrorReport.h>
 #include <FsHelpers.h>
 #include <HalStorage.h>
+#include <HalSystem.h>
 #include <JpegToBmpConverter.h>
 #include <Logging.h>
+#include <Memory.h>
 #include <PngToBmpConverter.h>
 #include <Utf8.h>
 #include <ZipFile.h>
@@ -303,6 +306,7 @@ void Epub::parseCssFiles() const {
 
   // No cache yet - parse CSS files
   for (const auto& cssPath : cssFiles) {
+    HalSystem::setBreadcrumb("epub: parse css");
     LOG_DBG("EBP", "Parsing CSS file: %s", cssPath.c_str());
 
     // Check heap before parsing - CSS parsing allocates heavily
@@ -387,7 +391,11 @@ bool Epub::load(const bool buildIfMissing, const bool skipLoadingCss) {
         }
         bookMetadataCache.reset();
         parseCssFiles();
-        bookMetadataCache.reset(new BookMetadataCache(cachePath));
+        bookMetadataCache = makeUniqueNoThrow<BookMetadataCache>(cachePath);
+        if (!bookMetadataCache) {
+          LOG_ERR_OOM("EBP", "BookMetadataCache", sizeof(BookMetadataCache));
+          return false;
+        }
         if (!bookMetadataCache->load()) {
           LOG_ERR("EBP", "Failed to reload cache after CSS rebuild");
           return false;

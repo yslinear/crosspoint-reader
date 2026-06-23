@@ -2,6 +2,7 @@
 
 #include <FontCacheManager.h>
 #include <GfxRenderer.h>
+#include <HalSystem.h>
 #include <Logging.h>
 #include <Serialization.h>
 

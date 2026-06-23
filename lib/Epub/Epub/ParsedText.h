@@ -24,6 +24,12 @@ class ParsedText {
   bool focusReadingEnabled;
   bool isNaturalAlign;
   bool hasRtlWord;
+  // True once this paragraph's genuine first line has been emitted. The streaming
+  // drain calls layoutAndExtractLines repeatedly as an oversized block fills; the
+  // first-line indent must apply ONLY to the real first line, never to breakIndex==0
+  // of a post-drain resumed tail — otherwise interior lines of long (esp. CJK)
+  // paragraphs get a spurious indent. Makes the indent cadence-independent.
+  bool firstLineEmitted_ = false;
   std::vector<std::string> reorderedWordsScratch;
   std::vector<EpdFontFamily::Style> reorderedStylesScratch;
   std::vector<uint16_t> reorderedWidthsScratch;
