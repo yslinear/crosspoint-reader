@@ -6,6 +6,7 @@
 #include <FsHelpers.h>
 #include <GfxRenderer.h>
 #include <HalStorage.h>
+#include <HalSystem.h>
 #include <I18n.h>
 #include <JsonSettingsIO.h>
 #include <Logging.h>

@@ -15,6 +15,16 @@
 RTC_NOINIT_ATTR char panicMessage[256];
 RTC_NOINIT_ATTR HalSystem::StackFrame panicStack[MAX_PANIC_STACK_DEPTH];
 
+// --- Observability (PHASE 1) ---
+// RTC_NOINIT survives a panic reboot but is garbage on cold boot, so guard the
+// breadcrumb with a magic word (mirrors the rtcLogMagic idiom in Logging.cpp).
+static constexpr uint32_t BREADCRUMB_MAGIC = 0xB00B5EED;
+RTC_NOINIT_ATTR char breadcrumb[48];
+RTC_NOINIT_ATTR uint32_t breadcrumbMagic;
+RTC_NOINIT_ATTR uint32_t lastSampledFreeHeap;
+RTC_NOINIT_ATTR uint32_t lastSampledMaxAlloc;
+RTC_NOINIT_ATTR uint32_t lastAttemptedAllocSize;
+
 extern "C" {
 
 void __real_panic_abort(const char* message);
@@ -106,6 +116,8 @@ void clearPanic() {
   for (size_t i = 0; i < MAX_PANIC_STACK_DEPTH; i++) {
     panicStack[i].sp = 0;
   }
+  breadcrumb[0] = '\0';
+  lastAttemptedAllocSize = 0;
   clearLastLogs();
 }
 
@@ -117,6 +129,21 @@ std::string getPanicInfo(bool full) {
 
     info += "CrossPoint version: " CROSSPOINT_VERSION;
     info += "\n\nPanic reason: " + std::string(panicMessage);
+
+    // Observability breadcrumb + last-sampled heap stats (PHASE 1). Guarded by
+    // the magic word so cold-boot RTC garbage is not reported as a breadcrumb.
+    if (breadcrumbMagic == BREADCRUMB_MAGIC) {
+      breadcrumb[sizeof(breadcrumb) - 1] = '\0';
+      // breadcrumb may be empty if a panic preceded the first setBreadcrumb (the magic
+      // is also stamped by sampleHeap); only print the operation line when it is set.
+      if (breadcrumb[0] != '\0') {
+        info += "\n\nLast operation: " + std::string(breadcrumb);
+      }
+      info += "\n\nFree heap (last sampled): " + std::to_string(lastSampledFreeHeap);
+      info += "\nLargest free block (last sampled): " + std::to_string(lastSampledMaxAlloc);
+      info += "\nLast attempted alloc: " + std::to_string(lastAttemptedAllocSize);
+    }
+
     info += "\n\nLast logs:\n" + getLastLogs();
     info += "\n\nStack memory:\n";
 
@@ -139,6 +166,28 @@ std::string getPanicInfo(bool full) {
     return info;
   }
 }
+
+void setBreadcrumb(const char* op) {
+  if (!op) return;
+  // Hand-rolled bounded copy + magic stamp: no heap, no snprintf. Mirrors the
+  // IRAM-safe copy idiom in __wrap_panic_abort above. Runs at normal runtime.
+  int i = 0;
+  for (; i < (int)sizeof(breadcrumb) - 1 && op[i]; i++) {
+    breadcrumb[i] = op[i];
+  }
+  breadcrumb[i] = '\0';
+  breadcrumbMagic = BREADCRUMB_MAGIC;
+}
+
+void sampleHeap() {
+  lastSampledFreeHeap = ESP.getFreeHeap();
+  lastSampledMaxAlloc = ESP.getMaxAllocHeap();
+  // Validate the RTC fields so getPanicInfo reports the heap stats even if a panic
+  // happens before the first setBreadcrumb (sampleHeap runs at boot + every ~10s).
+  breadcrumbMagic = BREADCRUMB_MAGIC;
+}
+
+void setLastAttemptedAllocSize(uint32_t size) { lastAttemptedAllocSize = size; }
 
 bool isRebootFromPanic() {
   const auto resetReason = esp_reset_reason();
