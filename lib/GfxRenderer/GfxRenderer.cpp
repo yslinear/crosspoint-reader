@@ -1,6 +1,7 @@
 #include "GfxRenderer.h"
 
 #include <BidiUtils.h>
+#include <ErrorReport.h>
 #include <FontDecompressor.h>
 #include <HalGPIO.h>
 #include <Logging.h>
@@ -54,23 +55,30 @@ const uint8_t* GfxRenderer::getGlyphBitmap(const EpdFontData* fontData, const Ep
   return &fontData->bitmap[glyph->dataOffset];
 }
 
-GfxRenderer::ResolvedGlyph GfxRenderer::resolveGlyph(const EpdFontFamily& primary, uint32_t cp,
+GfxRenderer::ResolvedGlyph GfxRenderer::resolveGlyph(const int primaryFontId, const EpdFontFamily& primary, uint32_t cp,
                                                      EpdFontFamily::Style style) const {
+  // The UI->CJK fallback applies ONLY to builtin UI (title/menu) fonts. For every
+  // other font — EPUB reader body, SD reading fonts — behave exactly as the
+  // pre-fallback code: primary.getGlyph (with its replacement glyph on a miss),
+  // no fallback probe. This keeps body-text measurement/rendering byte-identical
+  // to before the CJK feature and stops fallback glyph loads during section layout.
+  if (uiFallbackFontId_ == 0 || !isUiFallbackEligible(primaryFontId)) {
+    return {primary.getGlyph(cp, style), primary.getData(style)};
+  }
+
   // 1) Primary UI font covers the codepoint — the common Latin path.
   if (const EpdGlyph* g = primary.tryGetGlyph(cp, style)) {
     return {g, primary.getData(style)};
   }
-  // 2) Primary misses: consult the UI->CJK fallback font if one is registered.
-  if (uiFallbackFontId_ != 0) {
-    const auto it = fontMap.find(uiFallbackFontId_);
-    if (it != fontMap.end()) {
-      const EpdFontFamily& fallback = it->second;
-      // NOTE: this may load the glyph into the fallback's SD overflow ring,
-      // invalidating any previously-returned SD glyph pointer. Callers must
-      // consume one ResolvedGlyph before resolving the next.
-      if (const EpdGlyph* fg = fallback.tryGetGlyph(cp, style)) {
-        return {fg, fallback.getData(style)};
-      }
+  // 2) Primary misses: consult the UI->CJK fallback font.
+  const auto it = fontMap.find(uiFallbackFontId_);
+  if (it != fontMap.end()) {
+    const EpdFontFamily& fallback = it->second;
+    // NOTE: this may load the glyph into the fallback's SD overflow ring,
+    // invalidating any previously-returned SD glyph pointer. Callers must
+    // consume one ResolvedGlyph before resolving the next.
+    if (const EpdGlyph* fg = fallback.tryGetGlyph(cp, style)) {
+      return {fg, fallback.getData(style)};
     }
   }
   // 3) No coverage anywhere: fall back to the primary's replacement glyph,
@@ -399,10 +407,42 @@ int GfxRenderer::getTextWidth(const int fontId, const char* text, const EpdFontF
   std::string visual;
   const char* renderedText = resolveVisualText(text, visual, baseDir);
 
+  const auto& font = fontIt->second;
+
+  // Non-UI fonts (EPUB body, SD reading fonts) take no part in the UI->CJK
+  // fallback. For them, measure exactly as the pre-CJK-feature code did: bbox
+  // width via getTextDimensions. The fallback-aware advance walk below is only
+  // needed when fallback glyphs can actually appear, i.e. eligible UI fonts.
+  const bool fallbackEligible = uiFallbackFontId_ != 0 && isUiFallbackEligible(fontId);
+  if (!fallbackEligible) {
+    int w = 0, h = 0;
+    font.getTextDimensions(renderedText, &w, &h, style);
+    return w;
+  }
+
+  // Fast path for pure-ASCII strings on fallback-eligible fonts. The UI->CJK
+  // fallback can only fire for code points >= 0x80, so an all-ASCII string is
+  // measured exactly by the cheap getTextDimensions bbox path — no per-glyph
+  // resolveGlyph walk needed. This restores the pre-CJK common-case speed (e.g.
+  // FileBrowserActivity's path-truncation loop calling getTextWidth O(n) times
+  // on ASCII filenames). Only fall through to the advance walk when a non-ASCII
+  // byte is actually present.
+  bool hasNonAscii = false;
+  for (const char* p = renderedText; *p != '\0'; ++p) {
+    if (static_cast<uint8_t>(*p) >= 0x80) {
+      hasNonAscii = true;
+      break;
+    }
+  }
+  if (!hasNonAscii) {
+    int w = 0, h = 0;
+    font.getTextDimensions(renderedText, &w, &h, style);
+    return w;
+  }
+
   // Mirror drawText()'s glyph walk so measurement honors the UI->CJK fallback.
   // Delegating to EpdFontFamily::getTextDimensions would bypass resolveGlyph and
   // under-measure any line containing fallback (CJK) glyphs, clipping titles.
-  const auto& font = fontIt->second;
   const char* textCursor = renderedText;
   uint32_t cp;
   uint32_t prevCp = 0;
@@ -423,7 +463,7 @@ int GfxRenderer::getTextWidth(const int fontId, const char* text, const EpdFontF
     }
 
     // Resolve once; read advance then discard before the next resolve.
-    const ResolvedGlyph resolved = resolveGlyph(font, cp, style);
+    const ResolvedGlyph resolved = resolveGlyph(fontId, font, cp, style);
     prevAdvanceFP = resolved.glyph ? resolved.glyph->advanceX : 0;
     if ((style & (EpdFontFamily::SUP | EpdFontFamily::SUB)) != 0) {
       prevAdvanceFP = (prevAdvanceFP + 1) / 2;
@@ -505,7 +545,7 @@ void GfxRenderer::drawText(const int fontId, const int x, const int y, const cha
     // Resolve once: glyph + its source font data (primary, CJK fallback, or
     // replacement). Must be consumed (drawn) before the next resolveGlyph call,
     // which can evict an SD fallback glyph from the overflow ring.
-    const ResolvedGlyph resolved = resolveGlyph(font, cp, style);
+    const ResolvedGlyph resolved = resolveGlyph(fontId, font, cp, style);
     const EpdGlyph* glyph = resolved.glyph;
 
     lastBaseLeft = glyph ? glyph->left : 0;
@@ -1541,7 +1581,7 @@ int GfxRenderer::getTextAdvanceX(const int fontId, const char* text, EpdFontFami
     }
 
     // Resolve once (primary / CJK fallback / replacement); consume before next.
-    const ResolvedGlyph resolved = resolveGlyph(font, cp, style);
+    const ResolvedGlyph resolved = resolveGlyph(fontId, font, cp, style);
     prevAdvanceFP = resolved.glyph ? resolved.glyph->advanceX : 0;
     if ((style & (EpdFontFamily::SUP | EpdFontFamily::SUB)) != 0) {
       prevAdvanceFP = (prevAdvanceFP + 1) / 2;
@@ -1634,7 +1674,7 @@ void GfxRenderer::drawTextRotated90CW(const int fontId, const int x, const int y
     }
 
     // Resolve once (primary / CJK fallback / replacement); consume before next.
-    const ResolvedGlyph resolved = resolveGlyph(font, cp, style);
+    const ResolvedGlyph resolved = resolveGlyph(fontId, font, cp, style);
     const EpdGlyph* glyph = resolved.glyph;
 
     lastBaseLeft = glyph ? glyph->left : 0;
@@ -1684,6 +1724,16 @@ void GfxRenderer::freeBwBufferChunks() {
  * Returns true if buffer was stored successfully, false if allocation failed.
  */
 bool GfxRenderer::storeBwBuffer() {
+  // Preflight: each chunk is one contiguous BW_BUFFER_CHUNK_SIZE allocation, so the
+  // largest free block (getMaxAllocHeap) — not total free — decides whether even the
+  // first chunk can be placed. Bail before allocating any chunk if the heap is too
+  // fragmented, so we fail cleanly instead of allocating several chunks then aborting
+  // mid-loop. The grayscale path must degrade gracefully when this returns false.
+  if (ESP.getMaxAllocHeap() < BW_BUFFER_CHUNK_SIZE) {
+    LOG_ERR_OOM("GFX", "BW buffer chunk", BW_BUFFER_CHUNK_SIZE);
+    return false;
+  }
+
   // Allocate and copy each chunk
   for (size_t i = 0; i < bwBufferChunks.size(); i++) {
     // Check if any chunks are already allocated

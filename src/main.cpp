@@ -302,6 +302,12 @@ void setupDisplayAndFonts(bool seamless = false) {
   // 0 when no CJK fallback is installed — leaves the historic replacement-glyph
   // behavior unchanged.
   renderer.setUiFallbackFont(sdFontSystem.getUiFallbackFontId());
+  // Only the builtin UI (title/menu) fonts may use the CJK fallback. EPUB reader-body
+  // and SD reading fonts are intentionally excluded so the 12px fallback never renders
+  // body text and never loads fallback glyphs during section layout.
+  renderer.addUiFallbackEligibleFont(UI_10_FONT_ID);
+  renderer.addUiFallbackEligibleFont(UI_12_FONT_ID);
+  renderer.addUiFallbackEligibleFont(SMALL_FONT_ID);
 
   LOG_DBG("MAIN", "Fonts setup");
 }
@@ -494,9 +500,15 @@ void loop() {
 
   renderer.setFadingFix(SETTINGS.fadingFix);
 
-  if (Serial && millis() - lastMemPrint >= 10000) {
-    LOG_INF("MEM", "Free: %d bytes, Total: %d bytes, Min Free: %d bytes, MaxAlloc: %d bytes", ESP.getFreeHeap(),
-            ESP.getHeapSize(), ESP.getMinFreeHeap(), ESP.getMaxAllocHeap());
+  if (millis() - lastMemPrint >= 10000) {
+    // Sample heap into RTC_NOINIT so a later panic can report the last-known
+    // heap state. Done unconditionally (independent of serial) so the crash
+    // report is populated even in non-logging builds.
+    HalSystem::sampleHeap();
+    if (Serial) {
+      LOG_INF("MEM", "Free: %d bytes, Total: %d bytes, Min Free: %d bytes, MaxAlloc: %d bytes", ESP.getFreeHeap(),
+              ESP.getHeapSize(), ESP.getMinFreeHeap(), ESP.getMaxAllocHeap());
+    }
     lastMemPrint = millis();
   }
 
