@@ -1,5 +1,6 @@
 #include "BookMetadataCache.h"
 
+#include <HalSystem.h>
 #include <Logging.h>
 #include <Serialization.h>
 #include <Utf8.h>
@@ -14,6 +15,13 @@ constexpr uint8_t BOOK_CACHE_VERSION = 8;  // v8: TOC/book titles stored NFC-com
 constexpr char bookBinFile[] = "/book.bin";
 constexpr char tmpSpineBinFile[] = "/spine.bin.tmp";
 constexpr char tmpTocBinFile[] = "/toc.bin.tmp";
+
+// Generous cap on spine/TOC counts read from book.bin. Real EPUBs never approach
+// this; a larger count means the cache is corrupt. spineCount/tocCount drive
+// resize() calls in the size pass, so reject a bogus count before it can attempt
+// a pathological allocation on the ~380KB heap (treat as corrupt and let the
+// cache-version mechanism regenerate).
+constexpr uint16_t MAX_SPINE = 4096;
 }  // namespace
 
 /* ============= WRITING / BUILDING FUNCTIONS ================ */
@@ -375,6 +383,7 @@ void BookMetadataCache::createTocEntry(const std::string& title, const std::stri
 /* ============= READING / LOADING FUNCTIONS ================ */
 
 bool BookMetadataCache::load() {
+  HalSystem::setBreadcrumb("epub: load book cache");
   if (!Storage.openFileForRead("BMC", cachePath + bookBinFile, bookFile)) {
     return false;
   }
@@ -391,6 +400,17 @@ bool BookMetadataCache::load() {
   serialization::readPod(bookFile, lutOffset);
   serialization::readPod(bookFile, spineCount);
   serialization::readPod(bookFile, tocCount);
+
+  // spineCount/tocCount are untrusted (straight off disk). A count past the
+  // generous cap means the cache is corrupt: bail so load() returns false and the
+  // caller regenerates, rather than feeding a pathological count into resize().
+  if (spineCount > MAX_SPINE || tocCount > MAX_SPINE) {
+    LOG_ERR("BMC", "corrupt cache: spine %u / toc %u exceeds cap (%u), rebuilding", (unsigned)spineCount,
+            (unsigned)tocCount, (unsigned)MAX_SPINE);
+    // Explicit close() required: member variable persists beyond function scope
+    bookFile.close();
+    return false;
+  }
 
   serialization::readString(bookFile, coreMetadata.title);
   serialization::readString(bookFile, coreMetadata.author);

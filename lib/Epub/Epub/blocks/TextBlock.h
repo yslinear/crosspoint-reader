@@ -48,5 +48,10 @@ class TextBlock final : public Block {
   void render(const GfxRenderer& renderer, int fontId, int x, int y) const;
   BlockType getType() override { return TEXT_BLOCK; }
   bool serialize(HalFile& file) const;
-  static std::unique_ptr<TextBlock> deserialize(HalFile& file);
+  // Templated on the reader so the same forward-only body binds to a raw HalFile
+  // or a BufferedReader<HalFile>. Bodies live in TextBlock.cpp with explicit
+  // instantiations for both reader types to bound template bloat (one binary copy
+  // each, not one per including TU).
+  template <typename Reader>
+  static std::unique_ptr<TextBlock> deserialize(Reader& file);
 };

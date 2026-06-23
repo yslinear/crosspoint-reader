@@ -19,6 +19,16 @@ void FontCacheManager::clearCache() {
   }
 }
 
+void FontCacheManager::clearPrewarm() {
+  // Release per-page prewarm data without wiping the SD fonts' on-demand overflow
+  // rings (the shared UI / file-browser CJK glyph cache). The built-in
+  // decompressor cache is flash-backed and cheap to refill, so it is fine to drop.
+  if (fontDecompressor_) fontDecompressor_->clearCache();
+  for (auto& [id, font] : sdCardFonts_) {
+    font->clearPrewarm();
+  }
+}
+
 void FontCacheManager::prewarmCache(int fontId, const char* utf8Text, uint8_t styleMask) {
   // SD card font prewarm path: prewarm all requested styles in one call
   auto it = sdCardFonts_.find(fontId);

@@ -23,7 +23,11 @@ class SdCardFont {
   static constexpr uint16_t MAX_PAGE_GLYPHS = 512;
   static constexpr uint8_t MAX_STYLES = 4;
 
-  SdCardFont() = default;
+  // overflowCapacity: number of on-demand glyph slots in the per-instance
+  // overflow ring. Default 8 keeps existing reader-body callers byte-identical.
+  // The UI->CJK fallback instance passes a larger value (~64) so a long Han
+  // title doesn't evict-and-refetch from SD on every e-ink redraw.
+  explicit SdCardFont(uint32_t overflowCapacity = DEFAULT_OVERFLOW_CAPACITY);
   ~SdCardFont();
   // Owns raw buffers freed in dtor — no shallow-copy semantics. Make any
   // accidental pass-by-value or move a compile-time error.
@@ -41,8 +45,23 @@ class SdCardFont {
   // styleMask: bitmask of styles to prewarm (bit 0=regular, 1=bold, 2=italic, 3=bolditalic).
   // Default 0x0F = all present styles.
   // When metadataOnly=true, only glyph metrics are loaded (no bitmap data).
+  // maxBitmapBytes: HARD byte budget for the TOTAL resident prewarm footprint
+  //   across all prewarmed styles — the mini bitmap store PLUS the per-glyph
+  //   metadata (miniGlyphs/miniIntervals) PLUS the mini-kern tables, all of which
+  //   stay resident until the next prewarm/clearCache. Glyphs are loaded in
+  //   advance-table read order, each charged its full resident cost (dataLength +
+  //   sizeof(EpdGlyph) + sizeof(EpdUnicodeInterval)), until the running total
+  //   would exceed this budget; the rest are skipped (their metrics still load via
+  //   the miss path, so layout stays correct). Default SIZE_MAX = no cap
+  //   (foreground behaviour unchanged). The background worker passes its remaining
+  //   held-cache budget so its resident footprint can never exceed the cap.
+  // outBitmapBytes: if non-null, receives the ACTUAL resident bytes allocated
+  //   (bitmaps + per-glyph metadata + mini-kern, summed across styles). The worker
+  //   charges this against its held-cache accounting so the cap binds on the real
+  //   resident footprint, not a flat per-page estimate.
   // Returns number of glyphs that couldn't be loaded (0 on full success).
-  int prewarm(const char* utf8Text, uint8_t styleMask = 0x0F, bool metadataOnly = false);
+  int prewarm(const char* utf8Text, uint8_t styleMask = 0x0F, bool metadataOnly = false,
+              size_t maxBitmapBytes = SIZE_MAX, size_t* outBitmapBytes = nullptr);
 
   // Build a compact advance-only table for layout measurement.
   // Extracts ALL unique codepoints from words (no MAX_PAGE_GLYPHS cap),
@@ -55,13 +74,63 @@ class SdCardFont {
   // Returns the 12.4 fixed-point advance, or 0 if not found.
   uint16_t getAdvance(uint32_t codepoint, uint8_t style) const;
 
+  // Advance-ONLY resolution for measurement (UI->CJK fallback). Returns the
+  // 12.4 fixed-point advanceX for `codepoint`, fetching it from SD if it is not
+  // already in the advance cache — but NEVER loading the glyph bitmap (unlike
+  // tryGetGlyph(), which loads the full glyph into the overflow ring). This is
+  // what makes CJK file-list width measurement fast: each codepoint hits SD at
+  // most once (the result is written back into the advance cache), and only the
+  // 8-byte advanceX is read, not the bitmap.
+  //
+  // Parity contract with resolveGlyph()'s tier-2 (fallback) branch: on a coverage
+  // hit, the returned advance is byte-identical to fallback.tryGetGlyph(cp)->
+  // advanceX, because both read advanceX from the same EpdGlyph at the same file
+  // offset. On a TOTAL miss (the fallback font does not cover the codepoint at
+  // all — findGlobalGlyphIndex < 0) `found` is set false and the return value is
+  // meaningless; the caller must then fall back to the PRIMARY font's replacement
+  // glyph advance (resolveGlyph tier-3), NOT this font's own replacement. On a
+  // covered codepoint `found` is true.
+  //
+  // Cache-full behaviour: even when the advance cache is full (so the fetched
+  // value cannot be written back), the one-shot advance-only SD read is still
+  // performed and the real advanceX is returned — never 0.
+  //
+  // fetchedFromSd: optional write-back deferral. When null (default), a freshly
+  // read advance is written back into the cache immediately via a single-entry
+  // merge — convenient for one-off measurement (getTextWidth). When non-null, the
+  // immediate write-back is SKIPPED and *fetchedFromSd is set true iff the value
+  // came from a fresh SD read (false on a cache hit / total miss / read failure),
+  // so a hot caller (truncatedText) can stage all misses for ONE batched
+  // cacheAdvances() merge instead of paying a per-codepoint table realloc.
+  uint16_t getAdvanceOrFetch(uint32_t codepoint, uint8_t style, bool& found, bool* fetchedFromSd = nullptr);
+
+  // Public mirror of the private AdvanceEntry so callers can stage a sorted
+  // batch for cacheAdvances() without reaching into private state.
+  struct AdvanceEntryPublic {
+    uint32_t codepoint;
+    uint16_t advanceX;  // 12.4 fixed-point
+  };
+
+  // Persist just-fetched advances into the per-style table.
+  // Used by GfxRenderer::getTextAdvanceX to write back advances that were read
+  // from SD via the glyph-miss path (instead of discarding them), so the same
+  // CJK glyph is read from SD at most once per font lifetime. Merges N
+  // pre-sorted (by codepoint) entries in one allocation to avoid per-codepoint
+  // realloc churn in the layout hot loop.
+  void cacheAdvances(uint8_t style, const AdvanceEntryPublic* sortedNew, uint32_t newCount);
+
   // Returns true if advance table is populated for at least one style.
   bool hasAdvanceTable() const;
 
-  // Free mini data for all styles and restore stub EpdFontData.
-  // Preserves the persistent advance cache so repeated layout passes can reuse
-  // previously fetched metrics.
+  // Free mini data for all styles and restore stub EpdFontData. Also wipes the
+  // on-demand overflow ring. Preserves the persistent advance cache so repeated
+  // layout passes can reuse previously fetched metrics.
   void clearCache();
+
+  // Free per-page prewarm mini-data ONLY, preserving the on-demand overflow ring
+  // (shared UI/file-browser CJK glyph cache) and the advance cache. Use on a
+  // reader exit where the prewarm must be released but the UI cache must survive.
+  void clearPrewarm();
 
   // Drop the persistent advance cache. Call when unloading the SD font or
   // when font/size/family/glyph-table state changes.
@@ -76,6 +145,15 @@ class SdCardFont {
 
   // Resolve requested style bits to the closest present style.
   uint8_t resolveStyle(uint8_t style) const;
+
+  // Resolve a style the SAME way EpdFontFamily::getFont() does (bold/italic bits
+  // only; bold&italic -> boldItalic|bold|italic, else regular), so an advance read
+  // here lands on the same per-style EpdFont that the fallback family's
+  // tryGetGlyph(cp, style) would have used. Used by getAdvanceOrFetch() and by the
+  // measurement caller that batches its write-back via cacheAdvances(), so both
+  // target the identical style index. Differs from resolveStyle(), which has a
+  // richer (re-ordered) fallback chain not matched by the family.
+  uint8_t resolveFamilyStyle(uint8_t style) const;
 
   // Resolve every requested style bit through fallback and return the actual
   // styles that need cache/advance preparation.
@@ -203,15 +281,22 @@ class SdCardFont {
   };
   OverflowContext overflowCtx_[MAX_STYLES] = {};
 
-  // Shared on-demand overflow buffer (ring buffer of glyphs loaded via glyphMissHandler)
-  static constexpr uint32_t OVERFLOW_CAPACITY = 8;
+  // On-demand overflow buffer (ring buffer of glyphs loaded via glyphMissHandler).
+  // Capacity is per-instance (overflowCapacity_, set in the constructor) so the
+  // UI fallback can size a larger ring without inflating reader-body fonts.
+  static constexpr uint32_t DEFAULT_OVERFLOW_CAPACITY = 8;
   struct OverflowEntry {
     EpdGlyph glyph;
     uint8_t* bitmap = nullptr;
     uint32_t codepoint = 0;
     uint8_t styleIdx = 0;
   };
-  OverflowEntry overflow_[OVERFLOW_CAPACITY] = {};
+  // Heap-allocated ring of overflowCapacity_ entries (allocated in the
+  // constructor, freed in the destructor). Sized once at construction; a single
+  // OverflowEntry is 24 bytes, so the default 8-slot ring is 192 bytes and a
+  // 64-slot UI-fallback ring is ~1.5 KB — charged only when the fallback loads.
+  OverflowEntry* overflow_ = nullptr;
+  uint32_t overflowCapacity_ = DEFAULT_OVERFLOW_CAPACITY;
   uint32_t overflowCount_ = 0;
   uint32_t overflowNext_ = 0;
 
@@ -222,10 +307,22 @@ class SdCardFont {
     uint16_t advanceX;  // 12.4 fixed-point
   };
   // Per-style advance table. Sorted by codepoint for binary lookup.
-  // Bounded to ADVANCE_CACHE_LIMIT entries; persists across layout passes
-  // (across calls to clearCache()) so repeated indexing of the same font
+  // Bounded to a per-style cap (advanceCacheLimit_); persists across layout
+  // passes (across calls to clearCache()) so repeated indexing of the same font
   // amortizes SD reads. Cleared only on font unload or clearPersistentCache().
-  static constexpr uint32_t ADVANCE_CACHE_LIMIT = 768;
+  //
+  // Cap rationale (380KB RAM ceiling): AdvanceEntry is 8 bytes (unpacked), so a
+  // table costs cap*8 bytes per style. The Latin default keeps the historic
+  // ~6KB/style. CJK fonts have thousands of glyphs, so a 768-entry cap thrashes
+  // SD on every layout pass; we grow ONLY the regular style (index 0) to the
+  // CJK cap (~24KB) and leave bold/italic/bold-italic at the default. Worst case
+  // for a 4-style CJK reader font: 24KB + 3*6KB = ~42KB, gated to CJK fonts
+  // only (detected in load() via glyphCount). See load() for detection.
+  static constexpr uint32_t kAdvanceCacheLimitDefault = 768;     // ~6KB/style
+  static constexpr uint32_t kAdvanceCacheLimitCjk = 3072;        // ~24KB/style
+  static constexpr uint32_t kCjkGlyphCountThreshold = 2000;      // > Latin, < CJK
+  uint32_t advanceCacheLimit_[MAX_STYLES] = {kAdvanceCacheLimitDefault, kAdvanceCacheLimitDefault,
+                                             kAdvanceCacheLimitDefault, kAdvanceCacheLimitDefault};
   AdvanceEntry* advanceTable_[MAX_STYLES] = {};
   uint32_t advanceTableSize_[MAX_STYLES] = {};
   bool advanceTableLookup(uint8_t styleIdx, uint32_t codepoint, uint16_t* outAdvance) const;
@@ -250,7 +347,13 @@ class SdCardFont {
   int fetchAdvancesForCodepoints(uint32_t* codepoints, uint32_t cpCount, uint8_t styleMask);
   template <typename Iter>
   int buildAdvanceTableRange(Iter begin, Iter end, bool includeSpace, bool includeHyphen, uint8_t styleMask);
-  int prewarmStyle(uint8_t styleIdx, const uint32_t* codepoints, uint32_t cpCount, bool metadataOnly);
+  // remainingBitmapBytes (in/out): the bitmap byte budget still available for
+  // this style. prewarmStyle loads glyph bitmaps until the running total would
+  // exceed it, then truncates; on return it is decremented by the bytes this
+  // style actually allocated. Glyph METRICS are always loaded in full (layout
+  // correctness), only BITMAP loading is budget-gated.
+  int prewarmStyle(uint8_t styleIdx, const uint32_t* codepoints, uint32_t cpCount, bool metadataOnly,
+                   size_t& remainingBitmapBytes);
 
   // Global helpers
   void freeAll();

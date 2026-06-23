@@ -90,13 +90,23 @@ if (parsedSize != fileSize) {
 
 ## `section.bin`
 
-### Version 25
+### Version 28
 
 Each file in `sections/*.bin` stores one laid-out spine section. The header is
 also the cache-busting key: if any layout-affecting setting differs from the
 current reader settings, the section is discarded and rebuilt.
 
-Version 25 includes:
+Versions 26–28 are cache-invalidating layout/content changes only — the binary
+structure below is unchanged from version 25:
+
+- **v26–v27**: words are NFC-composed at layout time (invalidates older NFD caches).
+- **v28**: oversized text blocks drain per word-flush instead of per parse-buffer
+  chunk (bounds peak token memory to fix the large-CJK-chapter OOM), and the
+  first-line indent applies only to a paragraph's genuine first line, not to a
+  post-drain resumed tail. Both can shift line breaks / `wordXpos` on paragraphs
+  exceeding the drain threshold, so caches from older firmware are regenerated.
+
+Version 28 includes:
 
 - cache-busting fields for paragraph alignment, hyphenation, embedded CSS,
   image rendering mode, and Focus Reading
@@ -113,7 +123,7 @@ import std.mem;
 import std.string;
 import std.core;
 
-#define EXPECTED_VERSION 25
+#define EXPECTED_VERSION 28
 #define MAX_STRING_LENGTH 65535
 #define FOOTNOTE_NUMBER_LEN 32
 #define FOOTNOTE_HREF_LEN 96

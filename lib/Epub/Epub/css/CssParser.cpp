@@ -45,6 +45,15 @@ constexpr size_t MAX_RULES = 1500;
 // If below this threshold, we skip CSS to avoid display artifacts.
 constexpr size_t MIN_FREE_HEAP_FOR_CSS = 48 * 1024;
 
+// Minimum free heap to keep WHILE accumulating rules into rulesBySelector_.
+// Each kept selector allocates a hashtable node + an owned key string; a large
+// fixed-layout stylesheet (thousands of selectors) can exhaust the heap mid-parse,
+// and under -fno-exceptions operator new's bad_alloc becomes abort() (a hard panic).
+// MAX_RULES alone is insufficient: 1500 rules' worth of nodes can already exceed
+// the heap. Stop accepting new rules below this floor so styling degrades gracefully
+// instead of crashing, leaving headroom for the section layout that follows.
+constexpr size_t MIN_FREE_HEAP_DURING_CSS_PARSE = 64 * 1024;
+
 // Maximum length for a single selector string
 // Prevents parsing of extremely long or malformed selectors
 constexpr size_t MAX_SELECTOR_LENGTH = 256;
@@ -429,9 +438,11 @@ CssStyle CssParser::parseDeclarations(std::string_view declBlock) {
 // Rule processing
 
 void CssParser::processRuleBlockWithStyle(std::string_view selectorGroup, const CssStyle& style) {
-  // Check if we've reached the rule limit before processing
-  if (rulesBySelector_.size() >= MAX_RULES) {
-    LOG_DBG("CSS", "Reached max rules limit (%zu), stopping CSS parsing", MAX_RULES);
+  // Check if we've reached the rule limit (count OR free-heap floor) before processing.
+  // The heap floor prevents the mid-parse OOM->abort on large fixed-layout stylesheets.
+  if (rulesBySelector_.size() >= MAX_RULES || ESP.getFreeHeap() < MIN_FREE_HEAP_DURING_CSS_PARSE) {
+    LOG_DBG("CSS", "CSS rule budget reached (%zu rules, %u heap), stopping CSS parsing", rulesBySelector_.size(),
+            ESP.getFreeHeap());
     return;
   }
 
@@ -465,9 +476,12 @@ void CssParser::processRuleBlockWithStyle(std::string_view selectorGroup, const 
         constexpr std::string_view kUnsupportedSelectorChars = "+>[:#~* ";
         if (sel.find_first_of(kUnsupportedSelectorChars) != std::string_view::npos) return;
 
-        // Skip if this would exceed the rule limit
-        if (rulesBySelector_.size() >= MAX_RULES) {
-          LOG_DBG("CSS", "Reached max rules limit, stopping selector processing");
+        // Skip if this would exceed the rule limit (count) or drop free heap below the
+        // parse floor. The heap check is the OOM guard: emplace() below allocates a node
+        // + owned key, and on a thousands-selector fixed-layout stylesheet that bad_alloc
+        // would otherwise abort() under -fno-exceptions.
+        if (rulesBySelector_.size() >= MAX_RULES || ESP.getFreeHeap() < MIN_FREE_HEAP_DURING_CSS_PARSE) {
+          LOG_DBG("CSS", "CSS rule budget reached, stopping selector processing");
           limitReached = true;
           return;
         }

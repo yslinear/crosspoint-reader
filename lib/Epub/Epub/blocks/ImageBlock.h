@@ -22,7 +22,10 @@ class ImageBlock final : public Block {
 
   void render(GfxRenderer& renderer, const int x, const int y);
   bool serialize(HalFile& file);
-  static std::unique_ptr<ImageBlock> deserialize(HalFile& file);
+  // Templated reader: binds to HalFile or BufferedReader<HalFile>. Body and
+  // explicit instantiations live in ImageBlock.cpp.
+  template <typename Reader>
+  static std::unique_ptr<ImageBlock> deserialize(Reader& file);
 
  private:
   std::string imagePath;

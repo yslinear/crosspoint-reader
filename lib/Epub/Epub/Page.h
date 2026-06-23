@@ -39,7 +39,8 @@ class PageLine final : public PageElement {
   void render(GfxRenderer& renderer, int fontId, int xOffset, int yOffset) override;
   bool serialize(HalFile& file) override;
   PageElementTag getTag() const override { return TAG_PageLine; }
-  static std::unique_ptr<PageLine> deserialize(HalFile& file);
+  template <typename Reader>
+  static std::unique_ptr<PageLine> deserialize(Reader& file);
 };
 
 // New PageImage class
@@ -52,7 +53,8 @@ class PageImage final : public PageElement {
   void render(GfxRenderer& renderer, int fontId, int xOffset, int yOffset) override;
   bool serialize(HalFile& file) override;
   PageElementTag getTag() const override { return TAG_PageImage; }
-  static std::unique_ptr<PageImage> deserialize(HalFile& file);
+  template <typename Reader>
+  static std::unique_ptr<PageImage> deserialize(Reader& file);
   const ImageBlock& getImageBlock() const { return *imageBlock; }
 };
 
@@ -67,7 +69,8 @@ class PageHorizontalRule final : public PageElement {
   void render(GfxRenderer& renderer, int fontId, int xOffset, int yOffset) override;
   bool serialize(HalFile& file) override;
   PageElementTag getTag() const override { return TAG_PageHorizontalRule; }
-  static std::unique_ptr<PageHorizontalRule> deserialize(HalFile& file);
+  template <typename Reader>
+  static std::unique_ptr<PageHorizontalRule> deserialize(Reader& file);
 };
 
 class Page {
@@ -90,7 +93,12 @@ class Page {
   void render(GfxRenderer& renderer, int fontId, int xOffset, int yOffset) const;
   void renderImages(GfxRenderer& renderer, int fontId, int xOffset, int yOffset) const;
   bool serialize(HalFile& file) const;
-  static std::unique_ptr<Page> deserialize(HalFile& file);
+  // Templated reader: binds to HalFile or BufferedReader<HalFile>. The hot
+  // page-turn path (Section::loadPageFromSectionFile) wraps the file in a
+  // BufferedHalReader; on-disk byte order is unchanged. Bodies and explicit
+  // instantiations live in Page.cpp.
+  template <typename Reader>
+  static std::unique_ptr<Page> deserialize(Reader& file);
 
   // Check if page contains any images (used to force full refresh)
   bool hasImages() const {

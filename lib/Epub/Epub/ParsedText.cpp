@@ -269,6 +269,32 @@ void ParsedText::addWord(std::string word, const EpdFontFamily::Style fontStyle,
   const bool wordStartsRtl = !hasRtlWord && mayContainRtlBytes(word.c_str()) &&
                              BidiUtils::startsWithRtl(word.c_str(), RTL_PER_WORD_PROBE_DEPTH);
 
+  // Reserve capacity across all 5 parallel token vectors before a push loop so a
+  // single word that expands into many tokens (CJK character splits, focus-reading
+  // sub-segments) can't trigger repeated mid-word reallocations. Previously only the
+  // focus path reserved (gated behind focusReadingEnabled); the CJK-split and plain
+  // branches pushed without reserving, fragmenting/OOMing DRAM on long CJK chapters.
+  // Mirrors the old focus reserve logic: geometric doubling with a 16-slot floor.
+  // Capacity only — zero effect on output.
+  const auto reserveFor = [&](const size_t maxNewTokens) {
+    const size_t requiredSize = words.size() + maxNewTokens;
+    if (words.capacity() >= requiredSize) {
+      return;
+    }
+    size_t newCapacity = words.capacity() * 2;
+    if (newCapacity < requiredSize) {
+      newCapacity = requiredSize;
+    }
+    if (newCapacity < 16) {
+      newCapacity = 16;
+    }
+    words.reserve(newCapacity);
+    wordStyles.reserve(newCapacity);
+    wordContinues.reserve(newCapacity);
+    wordNoSpaceBefore.reserve(newCapacity);
+    wordIsFocusSuffix.reserve(newCapacity);
+  };
+
   const auto pushToken = [&](std::string token, const bool continues, const bool noSpaceBefore,
                              const bool isFocusSuffix) {
     words.push_back(std::move(token));
@@ -287,6 +313,8 @@ void ParsedText::addWord(std::string word, const EpdFontFamily::Style fontStyle,
   }
 
   if (auto breakOffsets = cjkCharacterBreakByteOffsets(word); !breakOffsets.empty()) {
+    // Each break offset starts a new token, plus the trailing remainder token.
+    reserveFor(breakOffsets.size() + 1);
     bool firstToken = true;
     size_t tokenStart = 0;
     for (const size_t breakOffset : breakOffsets) {
@@ -307,6 +335,7 @@ void ParsedText::addWord(std::string word, const EpdFontFamily::Style fontStyle,
   }
 
   if (containsCjkBreakableCodepoint(word)) {
+    reserveFor(1);
     pushToken(std::move(word), effectiveAttachToPrevious, effectiveNoSpaceBefore, false);
     if (wordStartsRtl) {
       hasRtlWord = true;
@@ -316,6 +345,7 @@ void ParsedText::addWord(std::string word, const EpdFontFamily::Style fontStyle,
 
   // Already-bold text should stay fully bold; focus splitting would make its suffix regular later.
   if (!this->focusReadingEnabled || (baseStyle & EpdFontFamily::BOLD) != 0) {
+    reserveFor(1);
     pushToken(std::move(word), effectiveAttachToPrevious, effectiveNoSpaceBefore, false);
     if (wordStartsRtl) {
       hasRtlWord = true;
@@ -325,29 +355,10 @@ void ParsedText::addWord(std::string word, const EpdFontFamily::Style fontStyle,
 
   // --- FOCUS READING LOGIC BELOW ---
 
-  // Pre-reserve capacity to prevent mid-word heap reallocations.
-  size_t maxPossibleNewTokens = word.length();
-  size_t requiredSize = words.size() + maxPossibleNewTokens;
-
-  if (words.capacity() < requiredSize) {
-    // Emulate standard geometric growth (doubling) to ensure we don't reallocate on every word.
-    size_t newCapacity = words.capacity() * 2;
-
-    // Ensure the doubled capacity is actually enough for this specific word
-    if (newCapacity < requiredSize) {
-      newCapacity = requiredSize;
-    }
-    // Set a sensible minimum starting size so the first few words don't trigger tiny reallocations
-    if (newCapacity < 16) {
-      newCapacity = 16;
-    }
-
-    words.reserve(newCapacity);
-    wordStyles.reserve(newCapacity);
-    wordContinues.reserve(newCapacity);
-    wordNoSpaceBefore.reserve(newCapacity);
-    wordIsFocusSuffix.reserve(newCapacity);
-  }
+  // Pre-reserve capacity to prevent mid-word heap reallocations. Worst case the
+  // word splits into one token per character (alternating word / non-word runs,
+  // each word run further split into bold prefix + regular suffix).
+  reserveFor(word.length());
 
   // Lambda helper to process and push individual sub-segments of the string
   // Use std::string_view to avoid heap allocations when slicing
@@ -524,6 +535,9 @@ void ParsedText::layoutAndExtractLines(const GfxRenderer& renderer, const int fo
 
   // Remove consumed words so size() reflects only remaining words
   if (lineCount > 0) {
+    // The paragraph's first line has now been emitted; any later drain of this same
+    // ParsedText must not re-apply the first-line indent to its resumed tail.
+    firstLineEmitted_ = true;
     const size_t consumed = lineBreakIndices[lineCount - 1];
     words.erase(words.begin(), words.begin() + consumed);
     wordStyles.erase(wordStyles.begin(), wordStyles.begin() + consumed);
@@ -551,7 +565,7 @@ std::vector<size_t> ParsedText::computeLineBreaks(const GfxRenderer& renderer, c
     return {};
   }
 
-  const int firstLineIndent = resolveFirstLineIndent(true, renderer, fontId);
+  const int firstLineIndent = resolveFirstLineIndent(!firstLineEmitted_, renderer, fontId);
 
   // Ensure any word that would overflow even as the first entry on a line is split using fallback hyphenation.
   for (size_t i = 0; i < wordWidths.size(); ++i) {
@@ -664,7 +678,7 @@ std::vector<size_t> ParsedText::computeHyphenatedLineBreaks(const GfxRenderer& r
                                                             const int pageWidth, std::vector<uint16_t>& wordWidths,
                                                             std::vector<bool>& continuesVec,
                                                             std::vector<bool>& noSpaceBeforeVec) {
-  const int firstLineIndent = resolveFirstLineIndent(true, renderer, fontId);
+  const int firstLineIndent = resolveFirstLineIndent(!firstLineEmitted_, renderer, fontId);
 
   std::vector<size_t> lineBreakIndices;
   size_t currentIndex = 0;
@@ -831,7 +845,7 @@ void ParsedText::extractLine(const size_t breakIndex, const int pageWidth, const
   const size_t lastBreakAt = breakIndex > 0 ? lineBreakIndices[breakIndex - 1] : 0;
   const size_t lineWordCount = lineBreak - lastBreakAt;
 
-  const int firstLineIndent = resolveFirstLineIndent(breakIndex == 0, renderer, fontId);
+  const int firstLineIndent = resolveFirstLineIndent(breakIndex == 0 && !firstLineEmitted_, renderer, fontId);
 
   // Build line data by moving from the original vectors using index range
   std::vector<std::string> lineWords;

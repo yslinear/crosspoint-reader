@@ -1,5 +1,6 @@
 #include "JpegToFramebufferConverter.h"
 
+#include <ErrorReport.h>
 #include <FsHelpers.h>
 #include <GfxRenderer.h>
 #include <HalStorage.h>
@@ -360,10 +361,16 @@ bool JpegToFramebufferConverter::getDimensionsStatic(const std::string& imagePat
     LOG_ERR("JPG", "Not enough heap for JPEG decoder (%u free, need %u)", freeHeap, MIN_FREE_HEAP_FOR_JPEG);
     return false;
   }
+  // The JPEG decoder is one ~20 KB contiguous allocation, so the largest free block
+  // (getMaxAllocHeap) decides success, not total free.
+  if (ESP.getMaxAllocHeap() < JPEG_DECODER_APPROX_SIZE) {
+    LOG_ERR_OOM("JPG", "JPEG decoder (dimensions)", JPEG_DECODER_APPROX_SIZE);
+    return false;
+  }
 
   std::unique_ptr<JPEGDEC> jpeg(new (std::nothrow) JPEGDEC());
   if (!jpeg) {
-    LOG_ERR("JPG", "Failed to allocate JPEG decoder for dimensions");
+    LOG_ERR_OOM("JPG", "JPEG decoder (dimensions)", JPEG_DECODER_APPROX_SIZE);
     return false;
   }
 
@@ -390,10 +397,16 @@ bool JpegToFramebufferConverter::decodeToFramebuffer(const std::string& imagePat
     LOG_ERR("JPG", "Not enough heap for JPEG decoder (%u free, need %u)", freeHeap, MIN_FREE_HEAP_FOR_JPEG);
     return false;
   }
+  // The JPEG decoder is one ~20 KB contiguous allocation, so the largest free block
+  // (getMaxAllocHeap) decides success, not total free.
+  if (ESP.getMaxAllocHeap() < JPEG_DECODER_APPROX_SIZE) {
+    LOG_ERR_OOM("JPG", "JPEG decoder", JPEG_DECODER_APPROX_SIZE);
+    return false;
+  }
 
   std::unique_ptr<JPEGDEC> jpeg(new (std::nothrow) JPEGDEC());
   if (!jpeg) {
-    LOG_ERR("JPG", "Failed to allocate JPEG decoder");
+    LOG_ERR_OOM("JPG", "JPEG decoder", JPEG_DECODER_APPROX_SIZE);
     return false;
   }
 

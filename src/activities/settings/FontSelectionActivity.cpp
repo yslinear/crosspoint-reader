@@ -58,12 +58,20 @@ void FontSelectionActivity::onEnter() {
   if (registry_) {
     const auto& families = registry_->getFamilies();
     for (int i = 0; i < static_cast<int>(families.size()); i++) {
-      fonts_.push_back({families[i].name, false, static_cast<uint8_t>(CrossPointSettings::BUILTIN_FONT_COUNT + i)});
+      fonts_.push_back(
+          {prettifyFontName(families[i].name), false, static_cast<uint8_t>(CrossPointSettings::BUILTIN_FONT_COUNT + i)});
     }
   }
 
   selectedIndex_ = findCurrentFontIndex(registry_, SETTINGS.sdFontFamilyName, SETTINGS.fontFamily);
   previewFontIndex_ = selectedIndex_;
+
+  // Load the SD reader font for the current settings before the first preview
+  // render. Otherwise getReaderFontId() resolves to 0 (family not loaded) and
+  // falls through to a Latin builtin, so a CJK SD font's preview text renders as
+  // tofu until the user navigates. Mirrors ReaderActivity::onEnter; unconditional
+  // so it also reconciles the manager after a web-upload font change.
+  sdFontSystem.ensureLoaded(renderer);
 
   requestUpdate();
 }

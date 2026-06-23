@@ -74,8 +74,8 @@ std::string normalisePath(const std::string& path) {
 void sortFileList(std::vector<std::string>& strs) {
   std::sort(begin(strs), end(strs), [](const std::string& str1, const std::string& str2) {
     // Directories first
-    bool isDir1 = str1.back() == '/';
-    bool isDir2 = str2.back() == '/';
+    bool isDir1 = !str1.empty() && str1.back() == '/';
+    bool isDir2 = !str2.empty() && str2.back() == '/';
     if (isDir1 != isDir2) return isDir1;
 
     // Start naive natural sort

@@ -74,6 +74,59 @@ class GfxRenderer {
   mutable int _stripRows = 0;
   mutable bool _stripActive = false;
 
+  // UI->CJK glyph fallback. When non-zero, identifies an SD-card font family
+  // (registered in fontMap/sdCardFonts_) consulted for any codepoint the
+  // primary UI font lacks. 0 = no fallback (every miss draws the primary's
+  // replacement glyph, the historic behavior). 4 bytes, no allocation.
+  int uiFallbackFontId_ = 0;
+
+  // Primary fonts eligible to use the UI->CJK fallback. Only the builtin UI
+  // (title/menu) fonts are registered here from main.cpp. EPUB reader-body and
+  // SD reading fonts are intentionally excluded so the 12px UI fallback never
+  // renders body text and never loads fallback glyphs during section layout
+  // (the OOM window). lib/ must not include src/fontIds.h, so eligibility is
+  // pushed in by id. Tiny (a few ints), populated once at startup.
+  std::vector<int> uiFallbackEligibleFontIds_;
+  bool isUiFallbackEligible(int fontId) const {
+    for (const int id : uiFallbackEligibleFontIds_) {
+      if (id == fontId) return true;
+    }
+    return false;
+  }
+
+  // Result of resolving one codepoint to a concrete glyph + the font data it
+  // belongs to. glyph and sourceFontData MUST stay paired: getGlyphBitmap()
+  // and the is2Bit/ascender reads index into sourceFontData, so a glyph from
+  // one font with another font's data yields garbage / misaligned reads.
+  struct ResolvedGlyph {
+    const EpdGlyph* glyph;
+    const EpdFontData* sourceFontData;
+  };
+  // Resolve cp against `primary`, falling back to the UI fallback font when the
+  // primary lacks the glyph, and finally to the primary's replacement glyph.
+  // The fallback is consulted ONLY when primaryFontId is a registered UI font
+  // (see uiFallbackEligibleFontIds_); for every other font this behaves exactly
+  // as the pre-fallback code (primary.getGlyph with replacement), so EPUB body
+  // layout never loads CJK fallback glyphs.
+  // CRITICAL: an SD fallback glyph pointer is into the overflow ring and is
+  // invalidated by the NEXT resolve. Callers must fully consume (measure or
+  // draw) one ResolvedGlyph before resolving the next; never hold two.
+  ResolvedGlyph resolveGlyph(int primaryFontId, const EpdFontFamily& primary, uint32_t cp,
+                             EpdFontFamily::Style style) const;
+
+  // Measurement-only advance for one codepoint on a UI->CJK-fallback-eligible
+  // font, returned as 12.4 fixed-point (BEFORE any SUP/SUB halving, which the
+  // caller applies). This produces the SAME advance as resolveGlyph(...).glyph->
+  // advanceX would, but WITHOUT loading any glyph bitmap:
+  //   tier 1: primary.tryGetGlyph(cp, style)->advanceX           (in-RAM)
+  //   tier 2: UI fallback SdCardFont::getAdvanceOrFetch(...)      (advance-only SD)
+  //   tier 3 (fallback total-miss): primary.getGlyph(cp,style)->advanceX (replacement)
+  // Used by getTextWidth() and truncatedText() so CJK file-list width measurement
+  // never pays the per-glyph bitmap SD read. Returns 0 only if every tier yields a
+  // null glyph (no replacement glyph at all), matching the old resolveGlyph path.
+  int32_t measureGlyphAdvanceFP(int fontId, const EpdFontFamily& font, uint32_t cp,
+                                EpdFontFamily::Style style) const;
+
   void renderChar(const EpdFontFamily& fontFamily, uint32_t cp, int* x, int* y, bool pixelState,
                   EpdFontFamily::Style style) const;
   void freeBwBufferChunks();
@@ -111,6 +164,18 @@ class GfxRenderer {
   void clearSdCardFonts() { sdCardFonts_.clear(); }
   const std::map<int, SdCardFont*>& getSdCardFonts() const { return sdCardFonts_; }
   bool isSdCardFont(int fontId) const { return sdCardFonts_.count(fontId) > 0; }
+  // UI->CJK glyph fallback font (an SD-card CJK font registered like any other).
+  // Set to 0 to disable. See uiFallbackFontId_ and resolveGlyph().
+  void setUiFallbackFont(int id) { uiFallbackFontId_ = id; }
+  int getUiFallbackFontId() const { return uiFallbackFontId_; }
+  // Register a primary font id allowed to use the UI->CJK fallback. Only builtin UI
+  // (title/menu) fonts should be registered; body/reading fonts must not, so the
+  // fallback never fires during EPUB section layout. Idempotent.
+  void addUiFallbackEligibleFont(int fontId) {
+    if (!isUiFallbackEligible(fontId)) {
+      uiFallbackEligibleFontIds_.push_back(fontId);
+    }
+  }
   // Ensure SD card font glyph data is loaded for the given text. Called from layout code
   // (which holds a const GfxRenderer&) before measuring word widths. Safe to call on non-SD fonts (no-op).
   // styleMask: bitmask of styles to prepare (bit 0=regular, 1=bold, 2=italic, 3=bold-italic).
@@ -178,9 +243,9 @@ class GfxRenderer {
                        bool roundBottomLeft, bool roundBottomRight, Color color) const;
   void drawImage(const uint8_t bitmap[], int x, int y, int width, int height) const;
   void drawIcon(const uint8_t bitmap[], int x, int y, int width, int height) const;
-  void drawBitmap(const Bitmap& bitmap, int x, int y, int maxWidth, int maxHeight, float cropX = 0,
-                  float cropY = 0) const;
-  void drawBitmap1Bit(const Bitmap& bitmap, int x, int y, int maxWidth, int maxHeight) const;
+  void drawBitmap(const Bitmap& bitmap, int x, int y, int maxWidth, int maxHeight, float cropX = 0, float cropY = 0,
+                  bool allowUpscale = false) const;
+  void drawBitmap1Bit(const Bitmap& bitmap, int x, int y, int maxWidth, int maxHeight, bool allowUpscale = false) const;
   void fillPolygon(const int* xPoints, const int* yPoints, int numPoints, bool state = true) const;
 
   // Text

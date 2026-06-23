@@ -5,7 +5,17 @@
 
 #include <cstring>
 
+namespace {
+// Generous cap on parsed OPDS catalog entries. A single page of a well-formed
+// catalog rarely exceeds a few dozen; this only stops a pathological/abusive feed
+// from growing the entries vector without bound on the ~380KB heap.
+constexpr size_t MAX_OPDS_ENTRIES = 1000;
+}  // namespace
+
 OpdsParser::OpdsParser() {
+  // Pre-allocate for a typical catalog page to avoid repeated vector reallocations
+  // during streaming parse (heap rule 7). Conservative: most pages hold 10-50 entries.
+  entries.reserve(32);
   parser = XML_ParserCreate(nullptr);
   if (!parser) {
     errorOccured = true;
@@ -157,7 +167,14 @@ void XMLCALL OpdsParser::endElement(void* userData, const XML_Char* name) {
 
   if (strcmp(name, "entry") == 0 || strstr(name, ":entry") != nullptr) {
     if (!self->currentEntry.title.empty() && !self->currentEntry.href.empty()) {
-      self->entries.push_back(self->currentEntry);
+      if (self->entries.size() >= MAX_OPDS_ENTRIES) {
+        if (self->entries.size() == MAX_OPDS_ENTRIES) {
+          LOG_ERR("OPDS", "Entries hit cap (%zu), truncating", MAX_OPDS_ENTRIES);
+          self->entries.push_back(self->currentEntry);  // record cap boundary, then stop
+        }
+      } else {
+        self->entries.push_back(self->currentEntry);
+      }
     }
     self->inEntry = false;
   } else if (self->inEntry) {

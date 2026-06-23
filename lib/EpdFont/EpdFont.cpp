@@ -154,7 +154,7 @@ uint32_t EpdFont::applyLigatures(uint32_t cp, const char*& text) const {
   return cp;
 }
 
-const EpdGlyph* EpdFont::getGlyph(const uint32_t cp) const {
+const EpdGlyph* EpdFont::tryGetGlyph(const uint32_t cp) const {
   const int count = data->intervalCount;
   if (count == 0 && !data->glyphMissHandler) return nullptr;
 
@@ -181,6 +181,16 @@ const EpdGlyph* EpdFont::getGlyph(const uint32_t cp) const {
     const EpdGlyph* loaded = data->glyphMissHandler(data->glyphMissCtx, cp);
     if (loaded) return loaded;
   }
+
+  // True miss: no glyph for this codepoint in this font. Unlike getGlyph(), do NOT
+  // substitute the replacement glyph — the caller (e.g. the UI->CJK fallback in
+  // GfxRenderer) needs to distinguish "covered" from "not covered".
+  return nullptr;
+}
+
+const EpdGlyph* EpdFont::getGlyph(const uint32_t cp) const {
+  const EpdGlyph* g = tryGetGlyph(cp);
+  if (g) return g;
 
   if (cp != REPLACEMENT_GLYPH) {
     return getGlyph(REPLACEMENT_GLYPH);

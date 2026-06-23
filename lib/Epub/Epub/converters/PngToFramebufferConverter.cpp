@@ -1,5 +1,6 @@
 #include "PngToFramebufferConverter.h"
 
+#include <ErrorReport.h>
 #include <FsHelpers.h>
 #include <GfxRenderer.h>
 #include <HalStorage.h>
@@ -254,10 +255,17 @@ bool PngToFramebufferConverter::getDimensionsStatic(const std::string& imagePath
     LOG_ERR("PNG", "Not enough heap for PNG decoder (%u free, need %u)", freeHeap, MIN_FREE_HEAP_FOR_PNG);
     return false;
   }
+  // The PNG decoder is one ~42 KB contiguous allocation, so the largest free block
+  // (getMaxAllocHeap) decides success, not total free. Total free can be ample while
+  // fragmentation leaves no block large enough.
+  if (ESP.getMaxAllocHeap() < PNG_DECODER_APPROX_SIZE) {
+    LOG_ERR_OOM("PNG", "PNG decoder (dimensions)", PNG_DECODER_APPROX_SIZE);
+    return false;
+  }
 
   std::unique_ptr<PNG> png(new (std::nothrow) PNG());
   if (!png) {
-    LOG_ERR("PNG", "Failed to allocate PNG decoder for dimensions");
+    LOG_ERR_OOM("PNG", "PNG decoder (dimensions)", PNG_DECODER_APPROX_SIZE);
     return false;
   }
 
@@ -285,11 +293,17 @@ bool PngToFramebufferConverter::decodeToFramebuffer(const std::string& imagePath
     LOG_ERR("PNG", "Not enough heap for PNG decoder (%u free, need %u)", freeHeap, MIN_FREE_HEAP_FOR_PNG);
     return false;
   }
+  // The PNG decoder is one ~42 KB contiguous allocation, so the largest free block
+  // (getMaxAllocHeap) decides success, not total free.
+  if (ESP.getMaxAllocHeap() < PNG_DECODER_APPROX_SIZE) {
+    LOG_ERR_OOM("PNG", "PNG decoder", PNG_DECODER_APPROX_SIZE);
+    return false;
+  }
 
   // Heap-allocate PNG decoder (~42 KB) - freed at end of function
   std::unique_ptr<PNG> png(new (std::nothrow) PNG());
   if (!png) {
-    LOG_ERR("PNG", "Failed to allocate PNG decoder");
+    LOG_ERR_OOM("PNG", "PNG decoder", PNG_DECODER_APPROX_SIZE);
     return false;
   }
 

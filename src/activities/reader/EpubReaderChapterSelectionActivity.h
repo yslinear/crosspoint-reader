@@ -2,6 +2,8 @@
 #include <Epub.h>
 
 #include <memory>
+#include <string>
+#include <vector>
 
 #include "activities/Activity.h"
 #include "util/ButtonNavigator.h"
@@ -12,6 +14,12 @@ class EpubReaderChapterSelectionActivity final : public Activity {
   ButtonNavigator buttonNavigator;
   int currentSpineIndex = 0;
   int selectorIndex = 0;
+
+  // Indented TOC labels cached in RAM (built once in onEnter). getTocItem()
+  // reads book.bin per call (2 SD seeks + string reads); the list renderer
+  // requests every visible item on every navigation, so rendering from this
+  // cache keeps paging fast (mirrors FileBrowserActivity's cached listing).
+  std::vector<std::string> tocDisplay_;
 
   // Number of items that fit on a page, derived from logical screen height.
   // This adapts automatically when switching between portrait and landscape.

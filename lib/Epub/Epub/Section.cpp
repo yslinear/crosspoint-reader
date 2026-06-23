@@ -1,6 +1,8 @@
 #include "Section.h"
 
+#include <BufferedHalReader.h>
 #include <HalStorage.h>
+#include <HalSystem.h>
 #include <Logging.h>
 #include <Serialization.h>
 
@@ -10,8 +12,12 @@
 #include "parsers/ChapterHtmlSlimParser.h"
 
 namespace {
-// v27: words NFC-composed at layout time; bump invalidates NFD section caches.
-constexpr uint8_t SECTION_FILE_VERSION = 27;
+// v28: streaming drain (per-flush, not per-Expat-chunk) bounds oversized-block token
+// arrays to fix the large-CJK-chapter OOM, and the first-line indent is now applied
+// only to a paragraph's genuine first line (not to post-drain resumed tails). Both
+// can shift line breaks / wordXpos on >750-token paragraphs vs v27, so caches from
+// older firmware must be regenerated. Bump invalidates them.
+constexpr uint8_t SECTION_FILE_VERSION = 28;
 constexpr uint32_t HEADER_SIZE = sizeof(uint8_t) + sizeof(int) + sizeof(float) + sizeof(bool) + sizeof(uint8_t) +
                                  sizeof(uint16_t) + sizeof(uint16_t) + sizeof(uint16_t) + sizeof(bool) + sizeof(bool) +
                                  sizeof(uint8_t) + sizeof(bool) + sizeof(uint32_t) + sizeof(uint32_t) +
@@ -22,6 +28,13 @@ struct PageLutEntry {
   uint16_t paragraphIndex;
   uint16_t listItemIndex;
 };
+
+// Generous caps so a real book never truncates; they only stop pathological
+// growth (corrupt/adversarial content) from exhausting the ~380KB heap during
+// the build pass. The page LUT is also serialized as a uint16_t count, so it is
+// inherently bounded; this cap protects the in-memory vector before that point.
+constexpr size_t MAX_PAGE_LUT = 16384;
+constexpr size_t MAX_TOC_ANCHORS = 8192;
 }  // namespace
 
 uint32_t Section::onPageComplete(std::unique_ptr<Page> page) {
@@ -78,6 +91,7 @@ bool Section::loadSectionFile(const int fontId, const float lineCompression, con
                               const uint8_t paragraphAlignment, const uint16_t viewportWidth,
                               const uint16_t viewportHeight, const bool hyphenationEnabled, const bool embeddedStyle,
                               const uint8_t imageRendering, const bool focusReadingEnabled) {
+  HalSystem::setBreadcrumb("epub: load section cache");
   if (!Storage.openFileForRead("SCT", filePath, file)) {
     return false;
   }
@@ -154,6 +168,7 @@ bool Section::createSectionFile(const int fontId, const float lineCompression, c
                                 const uint16_t viewportHeight, const bool hyphenationEnabled, const bool embeddedStyle,
                                 const uint8_t imageRendering, const bool focusReadingEnabled,
                                 const std::function<void()>& popupFn) {
+  HalSystem::setBreadcrumb("epub: parse section");
   const auto localPath = epub->getSpineItem(spineIndex).href;
   const auto tmpHtmlPath = epub->getCachePath() + "/.tmp_" + std::to_string(spineIndex) + ".html";
 
@@ -230,6 +245,10 @@ bool Section::createSectionFile(const int fontId, const float lineCompression, c
       auto entry = epub->getTocItem(i);
       if (entry.spineIndex != spineIndex) break;
       if (!entry.anchor.empty()) {
+        if (tocAnchors.size() >= MAX_TOC_ANCHORS) {
+          LOG_ERR("SCT", "TOC anchors hit cap (%zu), truncating", MAX_TOC_ANCHORS);
+          break;
+        }
         tocAnchors.push_back(std::move(entry.anchor));
       }
     }
@@ -324,7 +343,14 @@ std::unique_ptr<Page> Section::loadPageFromSectionFile() {
   serialization::readPod(file, pagePos);
   file.seek(pagePos);
 
-  auto page = Page::deserialize(file);
+  // Wrap the positioned file in a forward buffer for the page read. Page data is
+  // streamed purely forward from pagePos via dozens of tiny POD/string reads;
+  // buffering collapses those per-read storage-mutex+SdFat round-trips into a few
+  // 4 KiB block reads. On-disk byte order is unchanged. The buffer is transient,
+  // scoped to this call, and freed at return (or never allocated on OOM, in which
+  // case BufferedHalReader transparently passes reads through to `file`).
+  BufferedHalReader reader(file);
+  auto page = Page::deserialize(reader);
   // Explicit close() required: member variable persists beyond function scope
   file.close();
   return page;

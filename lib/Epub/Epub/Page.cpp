@@ -1,5 +1,6 @@
 #include "Page.h"
 
+#include <BufferedHalReader.h>
 #include <GfxRenderer.h>
 #include <Logging.h>
 #include <Serialization.h>
@@ -32,7 +33,8 @@ bool PageLine::serialize(HalFile& file) {
   return block->serialize(file);
 }
 
-std::unique_ptr<PageLine> PageLine::deserialize(HalFile& file) {
+template <typename Reader>
+std::unique_ptr<PageLine> PageLine::deserialize(Reader& file) {
   int16_t xPos;
   int16_t yPos;
   serialization::readPod(file, xPos);
@@ -55,7 +57,8 @@ bool PageImage::serialize(HalFile& file) {
   return imageBlock->serialize(file);
 }
 
-std::unique_ptr<PageImage> PageImage::deserialize(HalFile& file) {
+template <typename Reader>
+std::unique_ptr<PageImage> PageImage::deserialize(Reader& file) {
   int16_t xPos;
   int16_t yPos;
   serialization::readPod(file, xPos);
@@ -82,7 +85,8 @@ bool PageHorizontalRule::serialize(HalFile& file) {
   return true;
 }
 
-std::unique_ptr<PageHorizontalRule> PageHorizontalRule::deserialize(HalFile& file) {
+template <typename Reader>
+std::unique_ptr<PageHorizontalRule> PageHorizontalRule::deserialize(Reader& file) {
   int16_t xPos = 0;
   int16_t yPos = 0;
   uint16_t width = 0;
@@ -143,7 +147,8 @@ bool Page::serialize(HalFile& file) const {
   return true;
 }
 
-std::unique_ptr<Page> Page::deserialize(HalFile& file) {
+template <typename Reader>
+std::unique_ptr<Page> Page::deserialize(Reader& file) {
   auto page = std::unique_ptr<Page>(new Page());
 
   uint16_t count;
@@ -192,3 +197,16 @@ std::unique_ptr<Page> Page::deserialize(HalFile& file) {
 
   return page;
 }
+
+// Explicit instantiations: one binary copy of each deserialize per reader type,
+// emitted here rather than re-instantiated in every including TU. The hot path
+// (Section::loadPageFromSectionFile) uses the BufferedHalReader instantiation;
+// the HalFile instantiation keeps any direct-file callers linking.
+template std::unique_ptr<PageLine> PageLine::deserialize<HalFile>(HalFile&);
+template std::unique_ptr<PageLine> PageLine::deserialize<BufferedHalReader>(BufferedHalReader&);
+template std::unique_ptr<PageImage> PageImage::deserialize<HalFile>(HalFile&);
+template std::unique_ptr<PageImage> PageImage::deserialize<BufferedHalReader>(BufferedHalReader&);
+template std::unique_ptr<PageHorizontalRule> PageHorizontalRule::deserialize<HalFile>(HalFile&);
+template std::unique_ptr<PageHorizontalRule> PageHorizontalRule::deserialize<BufferedHalReader>(BufferedHalReader&);
+template std::unique_ptr<Page> Page::deserialize<HalFile>(HalFile&);
+template std::unique_ptr<Page> Page::deserialize<BufferedHalReader>(BufferedHalReader&);

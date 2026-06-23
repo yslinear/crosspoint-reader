@@ -1,6 +1,7 @@
 #include "GfxRenderer.h"
 
 #include <BidiUtils.h>
+#include <ErrorReport.h>
 #include <FontDecompressor.h>
 #include <HalGPIO.h>
 #include <Logging.h>
@@ -52,6 +53,71 @@ const uint8_t* GfxRenderer::getGlyphBitmap(const EpdFontData* fontData, const Ep
     }
   }
   return &fontData->bitmap[glyph->dataOffset];
+}
+
+GfxRenderer::ResolvedGlyph GfxRenderer::resolveGlyph(const int primaryFontId, const EpdFontFamily& primary, uint32_t cp,
+                                                     EpdFontFamily::Style style) const {
+  // The UI->CJK fallback applies ONLY to builtin UI (title/menu) fonts. For every
+  // other font — EPUB reader body, SD reading fonts — behave exactly as the
+  // pre-fallback code: primary.getGlyph (with its replacement glyph on a miss),
+  // no fallback probe. This keeps body-text measurement/rendering byte-identical
+  // to before the CJK feature and stops fallback glyph loads during section layout.
+  if (uiFallbackFontId_ == 0 || !isUiFallbackEligible(primaryFontId)) {
+    return {primary.getGlyph(cp, style), primary.getData(style)};
+  }
+
+  // 1) Primary UI font covers the codepoint — the common Latin path.
+  if (const EpdGlyph* g = primary.tryGetGlyph(cp, style)) {
+    return {g, primary.getData(style)};
+  }
+  // 2) Primary misses: consult the UI->CJK fallback font.
+  const auto it = fontMap.find(uiFallbackFontId_);
+  if (it != fontMap.end()) {
+    const EpdFontFamily& fallback = it->second;
+    // NOTE: this may load the glyph into the fallback's SD overflow ring,
+    // invalidating any previously-returned SD glyph pointer. Callers must
+    // consume one ResolvedGlyph before resolving the next.
+    if (const EpdGlyph* fg = fallback.tryGetGlyph(cp, style)) {
+      return {fg, fallback.getData(style)};
+    }
+  }
+  // 3) No coverage anywhere: fall back to the primary's replacement glyph,
+  // preserving the historic behavior (getGlyph never returns nullptr).
+  return {primary.getGlyph(cp, style), primary.getData(style)};
+}
+
+int32_t GfxRenderer::measureGlyphAdvanceFP(const int fontId, const EpdFontFamily& font, uint32_t cp,
+                                           const EpdFontFamily::Style style) const {
+  // Non-fallback-eligible fonts (EPUB body, SD reading fonts) behave exactly as
+  // the pre-fallback resolveGlyph: primary.getGlyph (with replacement on a miss),
+  // NO fallback probe. This gate must match resolveGlyph() line-for-line so body
+  // measurement stays byte-identical and never consults the UI fallback.
+  if (uiFallbackFontId_ == 0 || !isUiFallbackEligible(fontId)) {
+    const EpdGlyph* g = font.getGlyph(cp, style);
+    return g ? g->advanceX : 0;
+  }
+  // Tier 1: primary UI font covers the codepoint (covered ASCII/Latin/punct).
+  // In-RAM, no SD. Byte-identical to resolveGlyph tier-1.
+  if (const EpdGlyph* g = font.tryGetGlyph(cp, style)) {
+    return g->advanceX;
+  }
+  // Tier 2: primary misses -> consult the UI->CJK fallback SD font for the
+  // ADVANCE ONLY (no bitmap load). getAdvanceOrFetch returns the same advanceX
+  // that resolveGlyph tier-2's fallback.tryGetGlyph(cp,style)->advanceX would,
+  // because both read advanceX from the same EpdGlyph at the same file offset.
+  const auto sdIt = sdCardFonts_.find(uiFallbackFontId_);
+  if (sdIt != sdCardFonts_.end()) {
+    bool found = false;
+    const uint16_t adv = sdIt->second->getAdvanceOrFetch(cp, static_cast<uint8_t>(style), found);
+    if (found) {
+      return adv;
+    }
+  }
+  // Tier 3: fallback total-miss (or fallback not registered as an SD font) ->
+  // primary's replacement glyph advance, matching resolveGlyph tier-3 /
+  // EpdFont::getGlyph.
+  const EpdGlyph* repl = font.getGlyph(cp, style);
+  return repl ? repl->advanceX : 0;
 }
 
 void GfxRenderer::ensureSdCardFontReady(int fontId, const char* utf8Text, uint8_t styleMask) const {
@@ -145,13 +211,13 @@ enum class TextRotation { None, Rotated90CW };
 //
 // The advance width is also halved in drawText() so layout reserves exactly the right
 // horizontal space for the scaled glyph.
-static void renderCharScaled(const GfxRenderer& renderer, GfxRenderer::RenderMode renderMode,
-                             const EpdFontFamily& fontFamily, const uint32_t cp, int cursorX, int cursorY,
-                             const bool pixelState, const EpdFontFamily::Style style) {
-  const EpdGlyph* glyph = fontFamily.getGlyph(cp, style);
+// glyph + fontData must be a matched pair from GfxRenderer::resolveGlyph (the
+// glyph indexes into fontData) so the UI->CJK fallback renders from the right
+// font. The SD overflow glyph pointer must not be re-resolved before this draws.
+static void renderCharScaled(const GfxRenderer& renderer, GfxRenderer::RenderMode renderMode, const EpdGlyph* glyph,
+                             const EpdFontData* fontData, int cursorX, int cursorY, const bool pixelState) {
   if (!glyph) return;
 
-  const EpdFontData* fontData = fontFamily.getData(style);
   const uint8_t* bitmap = renderer.getGlyphBitmap(fontData, glyph);
   if (!bitmap) return;
 
@@ -212,17 +278,18 @@ static void renderCharScaled(const GfxRenderer& renderer, GfxRenderer::RenderMod
   }
 }
 
+// glyph + fontData must be a matched pair from GfxRenderer::resolveGlyph so the
+// is2Bit/ascender reads and getGlyphBitmap() index into the SAME font (mixing a
+// fallback glyph with the primary's data yields garbage / misaligned reads).
+// The SD overflow glyph pointer must not be re-resolved before this consumes it.
 template <TextRotation rotation = TextRotation::None>
-static void renderCharImpl(const GfxRenderer& renderer, GfxRenderer::RenderMode renderMode,
-                           const EpdFontFamily& fontFamily, const uint32_t cp, int cursorX, int cursorY,
-                           const bool pixelState, const EpdFontFamily::Style style) {
-  const EpdGlyph* glyph = fontFamily.getGlyph(cp, style);
+static void renderCharImpl(const GfxRenderer& renderer, GfxRenderer::RenderMode renderMode, const EpdGlyph* glyph,
+                           const EpdFontData* fontData, int cursorX, int cursorY, const bool pixelState) {
   if (!glyph) {
-    LOG_ERR("GFX", "No glyph for codepoint %d", cp);
+    LOG_ERR("GFX", "No glyph to render");
     return;
   }
 
-  const EpdFontData* fontData = fontFamily.getData(style);
   const bool is2Bit = fontData->is2Bit;
   const uint8_t width = glyph->width;
   const uint8_t height = glyph->height;
@@ -374,9 +441,73 @@ int GfxRenderer::getTextWidth(const int fontId, const char* text, const EpdFontF
   std::string visual;
   const char* renderedText = resolveVisualText(text, visual, baseDir);
 
-  int w = 0, h = 0;
-  fontIt->second.getTextDimensions(renderedText, &w, &h, style);
-  return w;
+  const auto& font = fontIt->second;
+
+  // Non-UI fonts (EPUB body, SD reading fonts) take no part in the UI->CJK
+  // fallback. For them, measure exactly as the pre-CJK-feature code did: bbox
+  // width via getTextDimensions. The fallback-aware advance walk below is only
+  // needed when fallback glyphs can actually appear, i.e. eligible UI fonts.
+  const bool fallbackEligible = uiFallbackFontId_ != 0 && isUiFallbackEligible(fontId);
+  if (!fallbackEligible) {
+    int w = 0, h = 0;
+    font.getTextDimensions(renderedText, &w, &h, style);
+    return w;
+  }
+
+  // Fast path for pure-ASCII strings on fallback-eligible fonts. The UI->CJK
+  // fallback can only fire for code points >= 0x80, so an all-ASCII string is
+  // measured exactly by the cheap getTextDimensions bbox path — no per-glyph
+  // resolveGlyph walk needed. This restores the pre-CJK common-case speed (e.g.
+  // FileBrowserActivity's path-truncation loop calling getTextWidth O(n) times
+  // on ASCII filenames). Only fall through to the advance walk when a non-ASCII
+  // byte is actually present.
+  bool hasNonAscii = false;
+  for (const char* p = renderedText; *p != '\0'; ++p) {
+    if (static_cast<uint8_t>(*p) >= 0x80) {
+      hasNonAscii = true;
+      break;
+    }
+  }
+  if (!hasNonAscii) {
+    int w = 0, h = 0;
+    font.getTextDimensions(renderedText, &w, &h, style);
+    return w;
+  }
+
+  // Mirror drawText()'s glyph walk so measurement honors the UI->CJK fallback.
+  // Delegating to EpdFontFamily::getTextDimensions would bypass resolveGlyph and
+  // under-measure any line containing fallback (CJK) glyphs, clipping titles.
+  const char* textCursor = renderedText;
+  uint32_t cp;
+  uint32_t prevCp = 0;
+  int widthPx = 0;
+  int32_t prevAdvanceFP = 0;  // 12.4 fixed-point: prev glyph's advance + next kern for snap
+  while ((cp = utf8NextCodepoint(reinterpret_cast<const uint8_t**>(&textCursor)))) {
+    // Skip Hebrew Niqqud and combining marks — they add no advance (match drawText).
+    if (cp >= 0x0591 && cp <= 0x05C7) continue;
+    if (utf8IsCombiningMark(cp)) continue;
+
+    cp = font.applyLigatures(cp, textCursor, style);
+
+    // Differential rounding: snap (previous advance + current kern) together so
+    // measurement and drawText agree to the pixel.
+    if (prevCp != 0) {
+      const auto kernFP = font.getKerning(prevCp, cp, style);  // 4.4 fixed-point kern
+      widthPx += fp4::toPixel(prevAdvanceFP + kernFP);
+    }
+
+    // Advance-only: read the advance for cp without loading its bitmap. Mirrors
+    // resolveGlyph's tier-1/2/3 advance exactly, but the UI->CJK fallback tier
+    // (tier 2) reads ONLY advanceX from SD instead of loading the full glyph,
+    // which is what makes CJK file-list width measurement fast.
+    prevAdvanceFP = measureGlyphAdvanceFP(fontId, font, cp, style);
+    if ((style & (EpdFontFamily::SUP | EpdFontFamily::SUB)) != 0) {
+      prevAdvanceFP = (prevAdvanceFP + 1) / 2;
+    }
+    prevCp = cp;
+  }
+  widthPx += fp4::toPixel(prevAdvanceFP);  // final glyph's advance
+  return widthPx;
 }
 
 void GfxRenderer::drawCenteredText(const int fontId, const int y, const char* text, const bool black,
@@ -425,12 +556,15 @@ void GfxRenderer::drawText(const int fontId, const int x, const int y, const cha
     }
 
     if (utf8IsCombiningMark(cp)) {
+      // Combining marks stay on the primary font (intentionally not routed
+      // through the CJK fallback).
       const EpdGlyph* combiningGlyph = font.getGlyph(cp, style);
       if (!combiningGlyph) continue;
       const int raiseBy = combiningMark::raiseAboveBase(combiningGlyph->top, combiningGlyph->height, lastBaseTop);
       const int combiningX = combiningMark::centerOver(lastBaseX, lastBaseLeft, lastBaseWidth, combiningGlyph->left,
                                                        combiningGlyph->width);
-      renderCharImpl<TextRotation::None>(*this, renderMode, font, cp, combiningX, yPos - raiseBy, black, style);
+      renderCharImpl<TextRotation::None>(*this, renderMode, combiningGlyph, font.getData(style), combiningX,
+                                         yPos - raiseBy, black);
       continue;
     }
 
@@ -444,7 +578,11 @@ void GfxRenderer::drawText(const int fontId, const int x, const int y, const cha
       lastBaseX += fp4::toPixel(prevAdvanceFP + kernFP);       // snap 12.4 fixed-point to nearest pixel
     }
 
-    const EpdGlyph* glyph = font.getGlyph(cp, style);
+    // Resolve once: glyph + its source font data (primary, CJK fallback, or
+    // replacement). Must be consumed (drawn) before the next resolveGlyph call,
+    // which can evict an SD fallback glyph from the overflow ring.
+    const ResolvedGlyph resolved = resolveGlyph(fontId, font, cp, style);
+    const EpdGlyph* glyph = resolved.glyph;
 
     lastBaseLeft = glyph ? glyph->left : 0;
     lastBaseWidth = glyph ? glyph->width : 0;
@@ -460,9 +598,9 @@ void GfxRenderer::drawText(const int fontId, const int x, const int y, const cha
 
     if (isSupSub) {
       // yPos already carries the vertical offset applied by TextBlock::render().
-      renderCharScaled(*this, renderMode, font, cp, lastBaseX, yPos, black, style);
+      renderCharScaled(*this, renderMode, glyph, resolved.sourceFontData, lastBaseX, yPos, black);
     } else {
-      renderCharImpl<TextRotation::None>(*this, renderMode, font, cp, lastBaseX, yPos, black, style);
+      renderCharImpl<TextRotation::None>(*this, renderMode, glyph, resolved.sourceFontData, lastBaseX, yPos, black);
     }
     prevCp = cp;
   }
@@ -889,11 +1027,11 @@ void GfxRenderer::drawIcon(const uint8_t bitmap[], const int x, const int y, con
 }
 
 void GfxRenderer::drawBitmap(const Bitmap& bitmap, const int x, const int y, const int maxWidth, const int maxHeight,
-                             const float cropX, const float cropY) const {
+                             const float cropX, const float cropY, const bool allowUpscale) const {
   if (fontCacheManager_ && fontCacheManager_->isScanning()) return;
   // For 1-bit bitmaps, use optimized 1-bit rendering path (no crop support for 1-bit)
   if (bitmap.is1Bit() && cropX == 0.0f && cropY == 0.0f) {
-    drawBitmap1Bit(bitmap, x, y, maxWidth, maxHeight);
+    drawBitmap1Bit(bitmap, x, y, maxWidth, maxHeight, allowUpscale);
     return;
   }
 
@@ -920,7 +1058,7 @@ void GfxRenderer::drawBitmap(const Bitmap& bitmap, const int x, const int y, con
     hasTargetBounds = true;
   }
 
-  if (hasTargetBounds && fitScale < 1.0f) {
+  if (hasTargetBounds && (fitScale < 1.0f || allowUpscale)) {
     scale = fitScale;
     isScaled = true;
   }
@@ -939,16 +1077,38 @@ void GfxRenderer::drawBitmap(const Bitmap& bitmap, const int x, const int y, con
     return;
   }
 
+  // When upscaling (scale > 1) the source-pixel-driven nearest-neighbour map leaves gaps between
+  // consecutive destination pixels. Fill the destination SPAN [screen, nextScreen) so the scaled-up image
+  // is solid rather than a sparse grid. For scale <= 1 the span collapses to a single pixel (unchanged).
+  const bool upscaling = isScaled && scale > 1.0f;
   for (int bmpY = 0; bmpY < (bitmap.getHeight() - cropPixY); bmpY++) {
     // The BMP's (0, 0) is the bottom-left corner (if the height is positive, top-left if negative).
     // Screen's (0, 0) is the top-left corner.
-    int screenY = -cropPixY + (bitmap.isTopDown() ? bmpY : bitmap.getHeight() - 1 - bmpY);
+    const int srcY = -cropPixY + (bitmap.isTopDown() ? bmpY : bitmap.getHeight() - 1 - bmpY);
+    int screenY = srcY;
     if (isScaled) {
       screenY = std::floor(screenY * scale);
     }
     screenY += y;  // the offset should not be scaled
     if (screenY >= getScreenHeight()) {
       break;
+    }
+
+    // Destination row span: the next source row (bmpY+1) maps to nextRowScreenY; fill the half-open gap
+    // between this row and it so no screen row is left blank. The span direction is whatever sign the map
+    // produces (bottom-up bitmaps run screen-upward, top-down run screen-downward).
+    int screenYLo = screenY;
+    int screenYHi = screenY;
+    if (upscaling) {
+      const int nextSrcY = -cropPixY + (bitmap.isTopDown() ? bmpY + 1 : bitmap.getHeight() - 1 - (bmpY + 1));
+      const int nextRowScreenY = std::floor(nextSrcY * scale) + y;
+      if (nextRowScreenY > screenY) {
+        screenYHi = nextRowScreenY - 1;
+      } else if (nextRowScreenY < screenY) {
+        screenYLo = nextRowScreenY + 1;
+      }
+      if (screenYLo < 0) screenYLo = 0;
+      if (screenYHi >= getScreenHeight()) screenYHi = getScreenHeight() - 1;
     }
 
     if (bitmap.readNextRow(outputRow, rowBytes) != BmpReaderError::Ok) {
@@ -980,14 +1140,35 @@ void GfxRenderer::drawBitmap(const Bitmap& bitmap, const int x, const int y, con
         continue;
       }
 
+      // Destination column span (collapses to one pixel when not upscaling).
+      int screenXEnd = screenX;
+      if (upscaling) {
+        const int nextScreenX = std::floor((bmpX - cropPixX + 1) * scale) + x;
+        screenXEnd = std::max(screenX, nextScreenX - 1);
+        if (screenXEnd >= getScreenWidth()) screenXEnd = getScreenWidth() - 1;
+      }
+
       const uint8_t val = outputRow[bmpX / 4] >> (6 - ((bmpX * 2) % 8)) & 0x3;
 
+      bool draw = false;
+      bool state = true;
       if (renderMode == BW && val < 3) {
-        drawPixel(screenX, screenY);
+        draw = true;
+        state = true;
       } else if (renderMode == GRAYSCALE_MSB && (val == 1 || val == 2)) {
-        drawPixel(screenX, screenY, false);
+        draw = true;
+        state = false;
       } else if (renderMode == GRAYSCALE_LSB && val == 1) {
-        drawPixel(screenX, screenY, false);
+        draw = true;
+        state = false;
+      }
+
+      if (draw) {
+        for (int sy = screenYLo; sy <= screenYHi; sy++) {
+          for (int sx = screenX; sx <= screenXEnd; sx++) {
+            drawPixel(sx, sy, state);
+          }
+        }
       }
     }
   }
@@ -997,15 +1178,25 @@ void GfxRenderer::drawBitmap(const Bitmap& bitmap, const int x, const int y, con
 }
 
 void GfxRenderer::drawBitmap1Bit(const Bitmap& bitmap, const int x, const int y, const int maxWidth,
-                                 const int maxHeight) const {
+                                 const int maxHeight, const bool allowUpscale) const {
   float scale = 1.0f;
   bool isScaled = false;
-  if (maxWidth > 0 && bitmap.getWidth() > maxWidth) {
-    scale = static_cast<float>(maxWidth) / static_cast<float>(bitmap.getWidth());
-    isScaled = true;
+
+  // Compute the aspect-fit ratio against whichever bounds are present. When allowUpscale is false the
+  // bitmap is only ever scaled DOWN (fitScale < 1.0f); when true it is also scaled UP to fill the bounds.
+  bool hasTargetBounds = false;
+  float fitScale = 1.0f;
+  if (maxWidth > 0 && bitmap.getWidth() > 0) {
+    fitScale = static_cast<float>(maxWidth) / static_cast<float>(bitmap.getWidth());
+    hasTargetBounds = true;
   }
-  if (maxHeight > 0 && bitmap.getHeight() > maxHeight) {
-    scale = std::min(scale, static_cast<float>(maxHeight) / static_cast<float>(bitmap.getHeight()));
+  if (maxHeight > 0 && bitmap.getHeight() > 0) {
+    const float heightScale = static_cast<float>(maxHeight) / static_cast<float>(bitmap.getHeight());
+    fitScale = hasTargetBounds ? std::min(fitScale, heightScale) : heightScale;
+    hasTargetBounds = true;
+  }
+  if (hasTargetBounds && (fitScale < 1.0f || allowUpscale)) {
+    scale = fitScale;
     isScaled = true;
   }
 
@@ -1021,6 +1212,10 @@ void GfxRenderer::drawBitmap1Bit(const Bitmap& bitmap, const int x, const int y,
     return;
   }
 
+  // When upscaling, fill the destination SPAN between consecutive source pixels so the enlarged image is
+  // solid rather than a sparse grid (see the 2-bit path for the same fix). Collapses to single pixels when
+  // scale <= 1, so the down-scale and native-size paths are byte-for-byte unchanged.
+  const bool upscaling = isScaled && scale > 1.0f;
   for (int bmpY = 0; bmpY < bitmap.getHeight(); bmpY++) {
     // Read rows sequentially using readNextRow
     if (bitmap.readNextRow(outputRow, rowBytes) != BmpReaderError::Ok) {
@@ -1040,6 +1235,21 @@ void GfxRenderer::drawBitmap1Bit(const Bitmap& bitmap, const int x, const int y,
       continue;
     }
 
+    // Destination row span: fill the half-open gap toward the next source row (bmpY+1).
+    int screenYLo = screenY;
+    int screenYHi = screenY;
+    if (upscaling) {
+      const int nextBmpYOffset = bitmap.isTopDown() ? bmpY + 1 : bitmap.getHeight() - 1 - (bmpY + 1);
+      const int nextRowScreenY = y + static_cast<int>(std::floor(nextBmpYOffset * scale));
+      if (nextRowScreenY > screenY) {
+        screenYHi = nextRowScreenY - 1;
+      } else if (nextRowScreenY < screenY) {
+        screenYLo = nextRowScreenY + 1;
+      }
+      if (screenYLo < 0) screenYLo = 0;
+      if (screenYHi >= getScreenHeight()) screenYHi = getScreenHeight() - 1;
+    }
+
     for (int bmpX = 0; bmpX < bitmap.getWidth(); bmpX++) {
       int screenX = x + (isScaled ? static_cast<int>(std::floor(bmpX * scale)) : bmpX);
       if (screenX >= getScreenWidth()) {
@@ -1049,13 +1259,25 @@ void GfxRenderer::drawBitmap1Bit(const Bitmap& bitmap, const int x, const int y,
         continue;
       }
 
+      // Destination column span (collapses to one pixel when not upscaling).
+      int screenXEnd = screenX;
+      if (upscaling) {
+        const int nextScreenX = x + static_cast<int>(std::floor((bmpX + 1) * scale));
+        screenXEnd = std::max(screenX, nextScreenX - 1);
+        if (screenXEnd >= getScreenWidth()) screenXEnd = getScreenWidth() - 1;
+      }
+
       // Get 2-bit value (result of readNextRow quantization)
       const uint8_t val = outputRow[bmpX / 4] >> (6 - ((bmpX * 2) % 8)) & 0x3;
 
       // For 1-bit source: 0 or 1 -> map to black (0,1,2) or white (3)
       // val < 3 means black pixel (draw it)
       if (val < 3) {
-        drawPixel(screenX, screenY, true);
+        for (int sy = screenYLo; sy <= screenYHi; sy++) {
+          for (int sx = screenX; sx <= screenXEnd; sx++) {
+            drawPixel(sx, sy, true);
+          }
+        }
       }
       // White pixels (val == 3) are not drawn (leave background)
     }
@@ -1190,12 +1412,179 @@ std::string GfxRenderer::truncatedText(const int fontId, const char* text, const
   std::string item = text;
   // U+2026 HORIZONTAL ELLIPSIS (UTF-8: 0xE2 0x80 0xA6)
   const char* ellipsis = "\xe2\x80\xa6";
+  static constexpr uint32_t kEllipsisCp = 0x2026;
   int textWidth = getTextWidth(fontId, item.c_str(), style);
   if (textWidth <= maxWidth) {
-    // Text fits, return as is
+    // Text fits, return as is. (Byte-identical early-out, unchanged.)
     return item;
   }
 
+  // ---- O(L) fast path ---------------------------------------------------------
+  // The legacy loop below is O(L^2): each utf8RemoveLastChar re-measures the whole
+  // string, and on a fallback-eligible CJK font every getTextWidth pass walks the
+  // glyphs (loading bitmaps via resolveGlyph in the old code). For a folder of Han
+  // titles that is brutally slow. Replace it with a single L->R advance-only walk
+  // that records each prefix's cumulative width, then one backward scan to pick the
+  // longest prefix that fits with the ellipsis.
+  //
+  // Eligibility (else fall through to the legacy loop for byte-identical results):
+  //   * Fallback-eligible font only. For non-eligible fonts getTextWidth() measures
+  //     via the bbox path (getTextDimensions), NOT the advance walk, so this
+  //     advance-accumulating fast path would diverge.
+  //   * No RTL lead bytes (0xD6-0xD7 Hebrew, 0xD8-0xDB Arabic/Syriac). The legacy
+  //     code truncates the LOGICAL string but measures the bidi-VISUAL order; for
+  //     pure-LTR text resolveVisualText() is identity so logical == visual and the
+  //     fast path is exact. RTL falls back to the legacy loop.
+  //   * Prefix fits the fixed stack array (no heap in this UI hot path).
+  const bool fallbackEligible = uiFallbackFontId_ != 0 && isUiFallbackEligible(fontId);
+  bool hasRtl = false;
+  for (const unsigned char* q = reinterpret_cast<const unsigned char*>(item.c_str()); *q; ++q) {
+    if (*q >= 0xD6 && *q <= 0xDB) {
+      hasRtl = true;
+      break;
+    }
+  }
+
+  if (fallbackEligible && !hasRtl) {
+    const auto fontIt = fontMap.find(fontId);
+    if (fontIt != fontMap.end()) {
+      const auto& font = fontIt->second;
+      const bool isSupSub = (style & (EpdFontFamily::SUP | EpdFontFamily::SUB)) != 0;
+
+      // Per-prefix snapshot: the cumulative width and the running differential
+      // state AT the prefix boundary (byteOffset). widthRunning is the loop's
+      // accumulator BEFORE flushing the final glyph; prevAdvanceFP/lastCp are the
+      // state needed to append the ellipsis byte-identically to
+      // getTextWidth(prefix + ellipsis). See the width derivation below.
+      struct PrefixState {
+        size_t byteOffset;     // byte length of the prefix (post-ligature cut point)
+        int widthRunning;      // accumulated px before final-glyph flush
+        int32_t prevAdvanceFP;  // last glyph's advance (SUP/SUB scaled), 12.4 FP
+        uint32_t lastCp;        // last effective codepoint (for ellipsis boundary kern)
+      };
+      static constexpr uint32_t kMaxPrefixes = 128;
+      PrefixState prefixes[kMaxPrefixes];
+      uint32_t prefixCount = 0;
+
+      // Stage advance misses for ONE batched write-back (mirror getTextAdvanceX):
+      // getAdvanceOrFetch(..., &fetched) skips its own per-cp merge so we avoid a
+      // table realloc per codepoint; we merge once at the end.
+      SdCardFont::AdvanceEntryPublic missStage[64];
+      uint32_t missCount = 0;
+      const auto sdFallbackIt = sdCardFonts_.find(uiFallbackFontId_);
+      SdCardFont* sdFallback = (sdFallbackIt != sdCardFonts_.end()) ? sdFallbackIt->second : nullptr;
+      const uint8_t fallbackStyleIdx = sdFallback ? sdFallback->resolveFamilyStyle(static_cast<uint8_t>(style)) : 0;
+
+      const char* textCursor = item.c_str();
+      const char* base = textCursor;
+      uint32_t cp;
+      uint32_t prevCp = 0;
+      int widthRunning = 0;       // accumulator BEFORE final-glyph flush
+      int32_t prevAdvanceFP = 0;  // 12.4 FP, SUP/SUB scaled
+      bool overCap = false;
+
+      while ((cp = utf8NextCodepoint(reinterpret_cast<const uint8_t**>(&textCursor)))) {
+        // Skip Hebrew Niqqud and combining marks (no advance) — match getTextWidth.
+        // No prefix snapshot is recorded for a skipped cp; the cut point can only
+        // land at a base/effective codepoint, which is what the width walk measures.
+        if (cp >= 0x0591 && cp <= 0x05C7) continue;
+        if (utf8IsCombiningMark(cp)) continue;
+
+        cp = font.applyLigatures(cp, textCursor, style);
+
+        // Differential rounding: snap (previous advance + current kern) together.
+        if (prevCp != 0) {
+          const auto kernFP = font.getKerning(prevCp, cp, style);
+          widthRunning += fp4::toPixel(prevAdvanceFP + kernFP);
+        }
+
+        // Advance-only source for this cp (tier 1/2/3), identical to getTextWidth.
+        // For the fallback (tier 2) we defer write-back and stage the miss.
+        int32_t advFP;
+        if (const EpdGlyph* g = font.tryGetGlyph(cp, style)) {
+          advFP = g->advanceX;
+        } else if (sdFallback) {
+          bool found = false;
+          bool fetched = false;
+          const uint16_t a = sdFallback->getAdvanceOrFetch(cp, static_cast<uint8_t>(style), found, &fetched);
+          if (found) {
+            advFP = a;
+            if (fetched && missCount < (sizeof(missStage) / sizeof(missStage[0]))) {
+              // Dedup against already-staged (runs are short; staged set is small).
+              bool seen = false;
+              for (uint32_t m = 0; m < missCount; m++) {
+                if (missStage[m].codepoint == cp) {
+                  seen = true;
+                  break;
+                }
+              }
+              if (!seen) {
+                missStage[missCount].codepoint = cp;
+                missStage[missCount].advanceX = a;
+                missCount++;
+              }
+            }
+          } else {
+            const EpdGlyph* repl = font.getGlyph(cp, style);  // tier 3: primary replacement
+            advFP = repl ? repl->advanceX : 0;
+          }
+        } else {
+          const EpdGlyph* repl = font.getGlyph(cp, style);
+          advFP = repl ? repl->advanceX : 0;
+        }
+        if (isSupSub) advFP = (advFP + 1) / 2;
+
+        prevAdvanceFP = advFP;
+        prevCp = cp;
+
+        if (prefixCount >= kMaxPrefixes) {
+          overCap = true;
+          break;
+        }
+        prefixes[prefixCount].byteOffset = static_cast<size_t>(textCursor - base);
+        prefixes[prefixCount].widthRunning = widthRunning;
+        prefixes[prefixCount].prevAdvanceFP = prevAdvanceFP;
+        prefixes[prefixCount].lastCp = prevCp;
+        prefixCount++;
+      }
+
+      // One batched write-back of all freshly-fetched fallback advances.
+      if (sdFallback && missCount > 0) {
+        std::sort(missStage, missStage + missCount,
+                  [](const SdCardFont::AdvanceEntryPublic& a, const SdCardFont::AdvanceEntryPublic& b) {
+                    return a.codepoint < b.codepoint;
+                  });
+        sdFallback->cacheAdvances(fallbackStyleIdx, missStage, missCount);
+      }
+
+      if (!overCap) {
+        // Ellipsis tail advance (single glyph, SUP/SUB scaled like a measured cp).
+        int32_t ellipsisAdvFP = measureGlyphAdvanceFP(fontId, font, kEllipsisCp, style);
+        if (isSupSub) ellipsisAdvFP = (ellipsisAdvFP + 1) / 2;
+        const int ellipsisFlushPx = fp4::toPixel(ellipsisAdvFP);
+
+        // width(prefix + ellipsis), byte-identical to getTextWidth(prefix+ellipsis):
+        //   widthRunning(prefix)                              // accumulated steps
+        //   + toPixel(prevAdvanceFP(prefix) + kern(lastCp, U+2026))  // boundary step
+        //   + toPixel(advance(U+2026))                        // final flush
+        // Pick the LARGEST prefix with that total < maxWidth (matches the legacy
+        // ">= maxWidth -> remove" loop, which keeps the longest prefix that is < ).
+        for (int i = static_cast<int>(prefixCount) - 1; i >= 0; --i) {
+          const PrefixState& ps = prefixes[i];
+          const auto boundaryKernFP = font.getKerning(ps.lastCp, kEllipsisCp, style);
+          const int full = ps.widthRunning + fp4::toPixel(ps.prevAdvanceFP + boundaryKernFP) + ellipsisFlushPx;
+          if (full < maxWidth) {
+            return item.substr(0, ps.byteOffset) + ellipsis;
+          }
+        }
+        // No prefix fits -> just the ellipsis (matches item.empty() branch below).
+        return ellipsis;
+      }
+      // overCap: fall through to the legacy loop (rare: title > 128 codepoints).
+    }
+  }
+
+  // ---- Legacy O(L^2) fallback (byte-identical) --------------------------------
   while (!item.empty() && getTextWidth(fontId, (item + ellipsis).c_str(), style) >= maxWidth) {
     utf8RemoveLastChar(item);
   }
@@ -1443,13 +1832,46 @@ int GfxRenderer::getTextAdvanceX(const int fontId, const char* text, EpdFontFami
       return 0;
     }
     const auto& font = fontIt->second;
+    // #1 write-back: when an advance misses the cached table we read it from SD
+    // via getGlyph()'s glyph-miss path. Stage those (codepoint, advance) pairs
+    // and merge them into the SD font's advance table once at the end of the
+    // scan, so the same CJK glyph is read from SD at most once per font lifetime
+    // instead of on every layout pass. Fixed staging buffer (no heap in the hot
+    // loop); overflow beyond it is simply not written back this scan (the next
+    // pass re-stages it — bounded, correct).
+    SdCardFont::AdvanceEntryPublic missStage[64];
+    uint32_t missCount = 0;
     while (uint32_t cp = utf8NextCodepoint(reinterpret_cast<const uint8_t**>(&text))) {
       int32_t advFP = sdIt->second->getAdvance(cp, styleIdx);
       if (advFP == 0 && !utf8IsCombiningMark(cp)) {
         const EpdGlyph* glyph = font.getGlyph(cp, style);
         advFP = glyph ? glyph->advanceX : 0;
+        if (glyph) {
+          // Stage for write-back unless already staged this scan (dedup keeps
+          // the staged set sorted-after-sort unique; tiny linear scan, runs are
+          // short). Skip if the staging buffer is full.
+          bool seen = false;
+          for (uint32_t m = 0; m < missCount; m++) {
+            if (missStage[m].codepoint == cp) {
+              seen = true;
+              break;
+            }
+          }
+          if (!seen && missCount < (sizeof(missStage) / sizeof(missStage[0]))) {
+            missStage[missCount].codepoint = cp;
+            missStage[missCount].advanceX = static_cast<uint16_t>(advFP);
+            missCount++;
+          }
+        }
       }
       widthFP += isSupSub ? (advFP + 1) / 2 : advFP;
+    }
+    if (missCount > 0) {
+      std::sort(missStage, missStage + missCount,
+                [](const SdCardFont::AdvanceEntryPublic& a, const SdCardFont::AdvanceEntryPublic& b) {
+                  return a.codepoint < b.codepoint;
+                });
+      sdIt->second->cacheAdvances(styleIdx, missStage, missCount);
     }
     return fp4::toPixel(widthFP);
   }
@@ -1478,8 +1900,10 @@ int GfxRenderer::getTextAdvanceX(const int fontId, const char* text, EpdFontFami
       widthPx += fp4::toPixel(prevAdvanceFP + kernFP);         // snap 12.4 fixed-point to nearest pixel
     }
 
-    const EpdGlyph* glyph = font.getGlyph(cp, style);
-    prevAdvanceFP = glyph ? glyph->advanceX : 0;
+    // Advance-only (primary / CJK fallback advance / replacement). Byte-identical
+    // to resolveGlyph's advance, but the fallback tier reads ONLY advanceX from
+    // SD instead of loading the glyph bitmap. This is a measurement-only walk.
+    prevAdvanceFP = measureGlyphAdvanceFP(fontId, font, cp, style);
     if ((style & (EpdFontFamily::SUP | EpdFontFamily::SUB)) != 0) {
       prevAdvanceFP = (prevAdvanceFP + 1) / 2;
     }
@@ -1549,13 +1973,15 @@ void GfxRenderer::drawTextRotated90CW(const int fontId, const int x, const int y
     }
 
     if (utf8IsCombiningMark(cp)) {
+      // Combining marks stay on the primary font (not routed through fallback).
       const EpdGlyph* combiningGlyph = font.getGlyph(cp, style);
       if (!combiningGlyph) continue;
       const int raiseBy = combiningMark::raiseAboveBase(combiningGlyph->top, combiningGlyph->height, lastBaseTop);
       const int combiningX = x - raiseBy;
       const int combiningY = combiningMark::centerOverRotated90CW(lastBaseY, lastBaseLeft, lastBaseWidth,
                                                                   combiningGlyph->left, combiningGlyph->width);
-      renderCharImpl<TextRotation::Rotated90CW>(*this, renderMode, font, cp, combiningX, combiningY, black, style);
+      renderCharImpl<TextRotation::Rotated90CW>(*this, renderMode, combiningGlyph, font.getData(style), combiningX,
+                                                combiningY, black);
       continue;
     }
 
@@ -1568,14 +1994,16 @@ void GfxRenderer::drawTextRotated90CW(const int fontId, const int x, const int y
       lastBaseY -= fp4::toPixel(prevAdvanceFP + kernFP);       // snap 12.4 fixed-point to nearest pixel
     }
 
-    const EpdGlyph* glyph = font.getGlyph(cp, style);
+    // Resolve once (primary / CJK fallback / replacement); consume before next.
+    const ResolvedGlyph resolved = resolveGlyph(fontId, font, cp, style);
+    const EpdGlyph* glyph = resolved.glyph;
 
     lastBaseLeft = glyph ? glyph->left : 0;
     lastBaseWidth = glyph ? glyph->width : 0;
     lastBaseTop = glyph ? glyph->top : 0;
     prevAdvanceFP = glyph ? glyph->advanceX : 0;  // 12.4 fixed-point
 
-    renderCharImpl<TextRotation::Rotated90CW>(*this, renderMode, font, cp, x, lastBaseY, black, style);
+    renderCharImpl<TextRotation::Rotated90CW>(*this, renderMode, glyph, resolved.sourceFontData, x, lastBaseY, black);
     prevCp = cp;
   }
 }
@@ -1617,6 +2045,16 @@ void GfxRenderer::freeBwBufferChunks() {
  * Returns true if buffer was stored successfully, false if allocation failed.
  */
 bool GfxRenderer::storeBwBuffer() {
+  // Preflight: each chunk is one contiguous BW_BUFFER_CHUNK_SIZE allocation, so the
+  // largest free block (getMaxAllocHeap) — not total free — decides whether even the
+  // first chunk can be placed. Bail before allocating any chunk if the heap is too
+  // fragmented, so we fail cleanly instead of allocating several chunks then aborting
+  // mid-loop. The grayscale path must degrade gracefully when this returns false.
+  if (ESP.getMaxAllocHeap() < BW_BUFFER_CHUNK_SIZE) {
+    LOG_ERR_OOM("GFX", "BW buffer chunk", BW_BUFFER_CHUNK_SIZE);
+    return false;
+  }
+
   // Allocate and copy each chunk
   for (size_t i = 0; i < bwBufferChunks.size(); i++) {
     // Check if any chunks are already allocated

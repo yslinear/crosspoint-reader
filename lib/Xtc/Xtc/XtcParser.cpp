@@ -15,6 +15,15 @@
 
 namespace xtc {
 
+// Generous cap on the chapter table. chapterCount is derived from on-disk offsets
+// (available / chapterSize) and a corrupt/oversized file can inflate it toward
+// fileSize/96 (~175k entries for a 16MB file). Clamp before reserve()/the read
+// loop so a bad file can never drive a pathological allocation on the ~380KB
+// heap. On hit we truncate (keep the first MAX_XTC_CHAPTERS), never abort.
+namespace {
+constexpr size_t MAX_XTC_CHAPTERS = 8192;
+}  // namespace
+
 XtcParser::XtcParser()
     : m_isOpen(false),
       m_defaultWidth(DISPLAY_WIDTH),
@@ -313,9 +322,16 @@ XtcError XtcParser::readChapters() {
 
   constexpr size_t chapterSize = 96;
   const uint64_t available = maxOffset - chapterOffset;
-  const size_t chapterCount = static_cast<size_t>(available / chapterSize);
+  size_t chapterCount = static_cast<size_t>(available / chapterSize);
   if (chapterCount == 0) {
     return XtcError::OK;
+  }
+
+  // chapterCount is derived from untrusted on-disk offsets. Truncate to the
+  // generous cap so a corrupt file can't drive a pathological reserve()/loop.
+  if (chapterCount > MAX_XTC_CHAPTERS) {
+    LOG_ERR("XTC", "chapter count %zu exceeds cap (%zu), truncating", chapterCount, MAX_XTC_CHAPTERS);
+    chapterCount = MAX_XTC_CHAPTERS;
   }
 
   if (!m_file.seek64(chapterOffset)) {
@@ -459,6 +475,63 @@ size_t XtcParser::loadPage(uint32_t pageIndex, uint8_t* buffer, size_t bufferSiz
   size_t bytesRead = m_file.read(buffer, bitmapSize);
   if (bytesRead != bitmapSize) {
     LOG_DBG("XTC", "Page read error: expected %u, got %u", bitmapSize, bytesRead);
+    m_lastError = XtcError::READ_ERROR;
+    return 0;
+  }
+
+  m_lastError = XtcError::OK;
+  return bytesRead;
+}
+
+size_t XtcParser::loadPageRegion(uint32_t pageIndex, size_t bitmapOffset, uint8_t* buffer, size_t length) {
+  if (!m_isOpen) {
+    m_lastError = XtcError::FILE_NOT_FOUND;
+    return 0;
+  }
+
+  if (pageIndex >= m_header.pageCount) {
+    m_lastError = XtcError::PAGE_OUT_OF_RANGE;
+    return 0;
+  }
+
+  PageInfo page;
+  if (!readPageTableEntry(pageIndex, page)) {
+    m_lastError = XtcError::READ_ERROR;
+    return 0;
+  }
+
+  if (!ensureFileOpen()) {
+    m_lastError = XtcError::FILE_NOT_FOUND;
+    return 0;
+  }
+
+  // Read and validate the page header before any partial read. Random byte
+  // addressability is only valid for uncompressed pages (compression == 0).
+  if (!m_file.seek64(page.offset)) {
+    m_lastError = XtcError::READ_ERROR;
+    return 0;
+  }
+  XtgPageHeader pageHeader;
+  if (m_file.read(reinterpret_cast<uint8_t*>(&pageHeader), sizeof(XtgPageHeader)) != sizeof(XtgPageHeader)) {
+    m_lastError = XtcError::READ_ERROR;
+    return 0;
+  }
+  const uint32_t expectedMagic = (m_bitDepth == 2) ? XTH_MAGIC : XTG_MAGIC;
+  if (pageHeader.magic != expectedMagic || pageHeader.compression != 0) {
+    m_lastError = XtcError::INVALID_MAGIC;
+    return 0;
+  }
+
+  // Bitmap data starts immediately after the header. Seek to the requested
+  // offset within the bitmap and read the contiguous region.
+  const uint64_t regionStart = page.offset + sizeof(XtgPageHeader) + static_cast<uint64_t>(bitmapOffset);
+  if (!m_file.seek64(regionStart)) {
+    m_lastError = XtcError::READ_ERROR;
+    return 0;
+  }
+  const size_t bytesRead = m_file.read(buffer, length);
+  if (bytesRead != length) {
+    LOG_DBG("XTC", "Region read short: page %u off %u len %u got %u", pageIndex, bitmapOffset, length, bytesRead);
     m_lastError = XtcError::READ_ERROR;
     return 0;
   }

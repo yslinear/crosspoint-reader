@@ -21,6 +21,12 @@ class Epub;
 
 #define MAX_WORD_SIZE 200
 
+// When a single text block accumulates more tokens than this, drain all but the
+// in-progress last line so the ParsedText word vectors stay bounded. Checked per
+// completed word inside characterData()'s loop, not just once per Expat chunk, so
+// a long unbroken CJK chunk can't push thousands of tokens before the valve runs.
+static constexpr size_t TEXT_BLOCK_DRAIN_THRESHOLD = 750;
+
 class ChapterHtmlSlimParser {
   std::shared_ptr<Epub> epub;
   const std::string& filepath;
@@ -29,6 +35,7 @@ class ChapterHtmlSlimParser {
   std::function<void()> popupFn;  // Popup callback
   int depth = 0;
   int skipUntilDepth = INT_MAX;
+  bool depthCapReported = false;  // log the nesting-depth cap only once per chapter
   int boldUntilDepth = INT_MAX;
   int italicUntilDepth = INT_MAX;
   int underlineUntilDepth = INT_MAX;
@@ -100,6 +107,7 @@ class ChapterHtmlSlimParser {
   void startNewTextBlock(const BlockStyle& blockStyle);
   void flushPendingAnchor();
   void flushPartWordBuffer();
+  void drainOversizedTextBlock();
   void makePages();
   static void applyDirectionToEntry(StyleStackEntry& entry, const CssStyle& css);
   void emitHorizontalRule(const BlockStyle& blockStyle);

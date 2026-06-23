@@ -84,6 +84,19 @@ class Xtc {
   size_t loadPage(uint32_t pageIndex, uint8_t* buffer, size_t bufferSize) const;
 
   /**
+   * Load a contiguous region of a page's bitmap data (after the page header).
+   *
+   * Used for band rendering: lets the reader pull only the columns a horizontal
+   * band needs instead of the whole page. Only valid for uncompressed pages.
+   * @param pageIndex Page index (0-based)
+   * @param bitmapOffset Byte offset into the bitmap data
+   * @param buffer Output buffer
+   * @param length Number of bytes to read
+   * @return Number of bytes read, 0 on failure
+   */
+  size_t loadPageRegion(uint32_t pageIndex, size_t bitmapOffset, uint8_t* buffer, size_t length) const;
+
+  /**
    * Load page with streaming callback
    * @param pageIndex Page index
    * @param callback Callback for each chunk
@@ -102,4 +115,24 @@ class Xtc {
 
   // Error information
   xtc::XtcError getLastError() const;
+
+ private:
+  // XTH (2-bit) cover-thumbnail generator. Reads the column-major page as a few
+  // contiguous vertical strips (one loadPageRegion per plane per strip) and
+  // dithers column-wise with 1-bit Floyd-Steinberg, writing a 1-bit top-down BMP
+  // to outPath. scaleInv_fp is the 16.16 inverse-scale factor. Returns false on
+  // any alloc/read failure (no abort).
+  bool generateThumbBmp2Bit(const xtc::PageInfo& pageInfo, uint16_t thumbWidth, uint16_t thumbHeight,
+                            uint32_t scaleInv_fp, const std::string& outPath) const;
+
+  // XTH (2-bit) sleep-screen cover generator. Like generateThumbBmp2Bit, reads the
+  // column-major page as contiguous vertical strips (bounded RAM, never the 96KB
+  // full page). Unlike the thumbnail, it preserves the 4 XTH gray levels: it
+  // downscales to a holdable grayscale target (the sleep screen upscales it) and
+  // writes a NATIVE-PALETTE 2-bit grayscale BMP (palette 0..3 -> 0/85/170/255) that
+  // renders at the display's 4 native gray levels with no dithering. dstWidth/
+  // dstHeight are the downscaled target; scaleInvX_fp/scaleInvY_fp are the 16.16
+  // per-axis inverse-scale factors. Returns false on any alloc/read failure (no abort).
+  bool generateCoverBmp2BitGray(const xtc::PageInfo& pageInfo, uint16_t dstWidth, uint16_t dstHeight,
+                                uint32_t scaleInvX_fp, uint32_t scaleInvY_fp, const std::string& outPath) const;
 };
