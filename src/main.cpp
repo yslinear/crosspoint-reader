@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <BackgroundWorker.h>
 #include <Epub.h>
 #include <FontCacheManager.h>
 #include <FontDecompressor.h>
@@ -7,6 +8,7 @@
 #include <HalDisplay.h>
 #include <HalGPIO.h>
 #include <HalPowerManager.h>
+#include <JpegToBmpConverter.h>
 #include <HalStorage.h>
 #include <HalSystem.h>
 #include <HalTiltSensor.h>
@@ -41,6 +43,18 @@ FontDecompressor fontDecompressor;
 SdCardFontSystem sdFontSystem;
 FontCacheManager fontCacheManager(renderer.getFontMap(), renderer.getSdCardFonts());
 static unsigned long allowSleepAt = 0;
+
+// Render-lock hooks for the BackgroundWorker (lib/ cannot include src/RenderLock).
+// A single heap RenderLock held between the take/give calls. Only the worker task
+// invokes these, and its jobs run sequentially, so the hold is never nested.
+static RenderLock* bgWorkerRenderLockHandle = nullptr;
+static void bgWorkerRenderLock() {
+  if (!bgWorkerRenderLockHandle) bgWorkerRenderLockHandle = new (std::nothrow) RenderLock();
+}
+static void bgWorkerRenderUnlock() {
+  delete bgWorkerRenderLockHandle;
+  bgWorkerRenderLockHandle = nullptr;
+}
 
 // Fonts
 EpdFont notoserif14RegularFont(&notoserif_14_regular);
@@ -352,6 +366,21 @@ void setup() {
     return;
   }
 
+  // Start the low-priority background worker now that the SD card is up. Jobs
+  // need HalStorage; the worker only runs once it has been begun (S1/S2). The
+  // worker borrows the global renderer for chapter layout / SD-font prewarm.
+  // Create the JPEG decode mutex now, while still single-threaded, so the
+  // soon-to-start worker's cover decode and the render-task home cover decode
+  // share one mutex (eager init, no check-then-create race).
+  JpegToBmpConverter::initDecodeMutex();
+  BG_WORKER.begin(renderer);
+  // Serialize the worker's shared renderer / SD-font mutation against the
+  // foreground render task via the global RenderLock. lib/ can't include
+  // src/RenderLock, so register take/give hooks (plain fn ptrs, no bloat). The
+  // hooks new/reset a single heap RenderLock; only the worker task calls them and
+  // jobs run sequentially, so there is never a nested or cross-task hold.
+  BG_WORKER.setRenderLockHooks(&bgWorkerRenderLock, &bgWorkerRenderUnlock);
+
   HalSystem::checkPanic();
 
   SETTINGS.loadFromFile();
@@ -535,6 +564,7 @@ void loop() {
       activityManager.preventAutoSleep()) {
     lastActivityTime = millis();         // Reset inactivity timer
     powerManager.setPowerSaving(false);  // Restore normal CPU frequency on user activity
+    BackgroundWorker::noteUserInput();   // Pause/defer background jobs on input (S5/S6)
   }
 
   static bool screenshotButtonsReleased = true;
