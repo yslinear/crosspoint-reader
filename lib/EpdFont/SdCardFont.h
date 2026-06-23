@@ -74,6 +74,36 @@ class SdCardFont {
   // Returns the 12.4 fixed-point advance, or 0 if not found.
   uint16_t getAdvance(uint32_t codepoint, uint8_t style) const;
 
+  // Advance-ONLY resolution for measurement (UI->CJK fallback). Returns the
+  // 12.4 fixed-point advanceX for `codepoint`, fetching it from SD if it is not
+  // already in the advance cache — but NEVER loading the glyph bitmap (unlike
+  // tryGetGlyph(), which loads the full glyph into the overflow ring). This is
+  // what makes CJK file-list width measurement fast: each codepoint hits SD at
+  // most once (the result is written back into the advance cache), and only the
+  // 8-byte advanceX is read, not the bitmap.
+  //
+  // Parity contract with resolveGlyph()'s tier-2 (fallback) branch: on a coverage
+  // hit, the returned advance is byte-identical to fallback.tryGetGlyph(cp)->
+  // advanceX, because both read advanceX from the same EpdGlyph at the same file
+  // offset. On a TOTAL miss (the fallback font does not cover the codepoint at
+  // all — findGlobalGlyphIndex < 0) `found` is set false and the return value is
+  // meaningless; the caller must then fall back to the PRIMARY font's replacement
+  // glyph advance (resolveGlyph tier-3), NOT this font's own replacement. On a
+  // covered codepoint `found` is true.
+  //
+  // Cache-full behaviour: even when the advance cache is full (so the fetched
+  // value cannot be written back), the one-shot advance-only SD read is still
+  // performed and the real advanceX is returned — never 0.
+  //
+  // fetchedFromSd: optional write-back deferral. When null (default), a freshly
+  // read advance is written back into the cache immediately via a single-entry
+  // merge — convenient for one-off measurement (getTextWidth). When non-null, the
+  // immediate write-back is SKIPPED and *fetchedFromSd is set true iff the value
+  // came from a fresh SD read (false on a cache hit / total miss / read failure),
+  // so a hot caller (truncatedText) can stage all misses for ONE batched
+  // cacheAdvances() merge instead of paying a per-codepoint table realloc.
+  uint16_t getAdvanceOrFetch(uint32_t codepoint, uint8_t style, bool& found, bool* fetchedFromSd = nullptr);
+
   // Public mirror of the private AdvanceEntry so callers can stage a sorted
   // batch for cacheAdvances() without reaching into private state.
   struct AdvanceEntryPublic {
@@ -115,6 +145,15 @@ class SdCardFont {
 
   // Resolve requested style bits to the closest present style.
   uint8_t resolveStyle(uint8_t style) const;
+
+  // Resolve a style the SAME way EpdFontFamily::getFont() does (bold/italic bits
+  // only; bold&italic -> boldItalic|bold|italic, else regular), so an advance read
+  // here lands on the same per-style EpdFont that the fallback family's
+  // tryGetGlyph(cp, style) would have used. Used by getAdvanceOrFetch() and by the
+  // measurement caller that batches its write-back via cacheAdvances(), so both
+  // target the identical style index. Differs from resolveStyle(), which has a
+  // richer (re-ordered) fallback chain not matched by the family.
+  uint8_t resolveFamilyStyle(uint8_t style) const;
 
   // Resolve every requested style bit through fallback and return the actual
   // styles that need cache/advance preparation.

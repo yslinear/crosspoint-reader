@@ -114,6 +114,19 @@ class GfxRenderer {
   ResolvedGlyph resolveGlyph(int primaryFontId, const EpdFontFamily& primary, uint32_t cp,
                              EpdFontFamily::Style style) const;
 
+  // Measurement-only advance for one codepoint on a UI->CJK-fallback-eligible
+  // font, returned as 12.4 fixed-point (BEFORE any SUP/SUB halving, which the
+  // caller applies). This produces the SAME advance as resolveGlyph(...).glyph->
+  // advanceX would, but WITHOUT loading any glyph bitmap:
+  //   tier 1: primary.tryGetGlyph(cp, style)->advanceX           (in-RAM)
+  //   tier 2: UI fallback SdCardFont::getAdvanceOrFetch(...)      (advance-only SD)
+  //   tier 3 (fallback total-miss): primary.getGlyph(cp,style)->advanceX (replacement)
+  // Used by getTextWidth() and truncatedText() so CJK file-list width measurement
+  // never pays the per-glyph bitmap SD read. Returns 0 only if every tier yields a
+  // null glyph (no replacement glyph at all), matching the old resolveGlyph path.
+  int32_t measureGlyphAdvanceFP(int fontId, const EpdFontFamily& font, uint32_t cp,
+                                EpdFontFamily::Style style) const;
+
   void renderChar(const EpdFontFamily& fontFamily, uint32_t cp, int* x, int* y, bool pixelState,
                   EpdFontFamily::Style style) const;
   void freeBwBufferChunks();

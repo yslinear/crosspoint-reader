@@ -1221,6 +1221,95 @@ uint16_t SdCardFont::getAdvance(uint32_t codepoint, uint8_t style) const {
   return 0;
 }
 
+uint8_t SdCardFont::resolveFamilyStyle(uint8_t style) const {
+  // Mirror EpdFontFamily::getFont() exactly (bold/italic bits only; SUP/SUB and
+  // other decoration bits are ignored for font selection). The fallback family is
+  // built from getEpdFont(0..3), so "present" here is equivalent to the family
+  // holding a non-null pointer for that style; falling through to REGULAR matches
+  // the family's final `return regular`.
+  const bool hasBold = (style & EpdFontFamily::BOLD) != 0;
+  const bool hasItalic = (style & EpdFontFamily::ITALIC) != 0;
+  if (hasBold && hasItalic) {
+    if (styles_[EpdFontFamily::BOLD_ITALIC].present) return EpdFontFamily::BOLD_ITALIC;
+    if (styles_[EpdFontFamily::BOLD].present) return EpdFontFamily::BOLD;
+    if (styles_[EpdFontFamily::ITALIC].present) return EpdFontFamily::ITALIC;
+  } else if (hasBold && styles_[EpdFontFamily::BOLD].present) {
+    return EpdFontFamily::BOLD;
+  } else if (hasItalic && styles_[EpdFontFamily::ITALIC].present) {
+    return EpdFontFamily::ITALIC;
+  }
+  return EpdFontFamily::REGULAR;
+}
+
+uint16_t SdCardFont::getAdvanceOrFetch(uint32_t codepoint, uint8_t style, bool& found, bool* fetchedFromSd) {
+  found = true;
+  if (fetchedFromSd) *fetchedFromSd = false;
+  // Select the SD style index EXACTLY as EpdFontFamily::getFont() does, so the
+  // advance read here resolves to the same per-style EpdFont that
+  // resolveGlyph()'s fallback.tryGetGlyph(cp, style) would have used. This keeps
+  // the advance-only measurement byte-identical to the glyph-loading path for
+  // bold/italic titles.
+  const uint8_t si = resolveFamilyStyle(style);
+  if (!loaded_ || !styles_[si].present) {
+    found = false;
+    return 0;
+  }
+
+  // Fast path: already in the persistent advance cache (in-RAM binary search).
+  uint16_t cached = 0;
+  if (advanceTableLookup(si, codepoint, &cached)) {
+    return cached;
+  }
+
+  // Cache miss. Resolve the glyph index in RAM (no SD). A negative index means
+  // the fallback font does not cover this codepoint at all — signal a TOTAL miss
+  // so the caller can fall back to the PRIMARY font's replacement glyph advance
+  // (resolveGlyph tier-3), matching tryGetGlyph()'s nullptr-on-miss contract.
+  const auto& s = styles_[si];
+  const int32_t gi = findGlobalGlyphIndex(s, codepoint);
+  if (gi < 0) {
+    found = false;
+    return 0;
+  }
+
+  // One-shot advance-only SD read: open the .cpfont, seek to this glyph's
+  // EpdGlyph record, read ONLY the 16-byte struct (NEVER the bitmap), take
+  // advanceX. Byte-identical to the advanceX tryGetGlyph() would have loaded,
+  // and to fetchAdvancesForCodepoints()'s per-glyph read.
+  HalFile file;
+  if (!Storage.openFileForRead("SDCF", filePath_, file)) {
+    LOG_ERR("SDCF", "getAdvanceOrFetch: failed to open .cpfont (style %u)", si);
+    // Graceful: treat as covered (found stays true) but report 0 advance. The
+    // caller's measurement degrades to a zero-width glyph rather than mis-routing
+    // to the primary replacement; an SD open failure here is already an error path.
+    return 0;
+  }
+  const uint32_t fileOff = s.glyphsFileOffset + static_cast<uint32_t>(gi) * sizeof(EpdGlyph);
+  EpdGlyph tempGlyph;
+  if (!file.seekSet(fileOff) ||
+      file.read(reinterpret_cast<uint8_t*>(&tempGlyph), sizeof(EpdGlyph)) != sizeof(EpdGlyph)) {
+    LOG_ERR("SDCF", "getAdvanceOrFetch: short/failed glyph read (style %u, glyph %d)", si, gi);
+    return 0;
+  }
+  const uint16_t advance = tempGlyph.advanceX;
+
+  if (fetchedFromSd) {
+    // Caller batches write-back: report the fresh SD read and DON'T merge here.
+    // The caller stages (codepoint, advance) and calls cacheAdvances() once, so a
+    // long uncached title pays a single table realloc instead of one per cp.
+    *fetchedFromSd = true;
+    return advance;
+  }
+
+  // Write back via the existing single-entry merge so this codepoint hits SD at
+  // most once. mergeIntoAdvanceTable() no-ops when the cache is full (oldSize >=
+  // limit); the MUSTFIX-CAP guarantee is that we have ALREADY read and are
+  // returning the real advance above regardless of whether the write-back lands.
+  const AdvanceEntry one{codepoint, advance};
+  mergeIntoAdvanceTable(si, &one, 1);
+  return advance;
+}
+
 // Given a sorted array of unique codepoints, resolve glyph indices per style,
 // batch-read advanceX from SD, and merge into the persistent advance table.
 // Caller owns the codepoints buffer.

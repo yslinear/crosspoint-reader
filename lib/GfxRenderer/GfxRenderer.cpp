@@ -86,6 +86,40 @@ GfxRenderer::ResolvedGlyph GfxRenderer::resolveGlyph(const int primaryFontId, co
   return {primary.getGlyph(cp, style), primary.getData(style)};
 }
 
+int32_t GfxRenderer::measureGlyphAdvanceFP(const int fontId, const EpdFontFamily& font, uint32_t cp,
+                                           const EpdFontFamily::Style style) const {
+  // Non-fallback-eligible fonts (EPUB body, SD reading fonts) behave exactly as
+  // the pre-fallback resolveGlyph: primary.getGlyph (with replacement on a miss),
+  // NO fallback probe. This gate must match resolveGlyph() line-for-line so body
+  // measurement stays byte-identical and never consults the UI fallback.
+  if (uiFallbackFontId_ == 0 || !isUiFallbackEligible(fontId)) {
+    const EpdGlyph* g = font.getGlyph(cp, style);
+    return g ? g->advanceX : 0;
+  }
+  // Tier 1: primary UI font covers the codepoint (covered ASCII/Latin/punct).
+  // In-RAM, no SD. Byte-identical to resolveGlyph tier-1.
+  if (const EpdGlyph* g = font.tryGetGlyph(cp, style)) {
+    return g->advanceX;
+  }
+  // Tier 2: primary misses -> consult the UI->CJK fallback SD font for the
+  // ADVANCE ONLY (no bitmap load). getAdvanceOrFetch returns the same advanceX
+  // that resolveGlyph tier-2's fallback.tryGetGlyph(cp,style)->advanceX would,
+  // because both read advanceX from the same EpdGlyph at the same file offset.
+  const auto sdIt = sdCardFonts_.find(uiFallbackFontId_);
+  if (sdIt != sdCardFonts_.end()) {
+    bool found = false;
+    const uint16_t adv = sdIt->second->getAdvanceOrFetch(cp, static_cast<uint8_t>(style), found);
+    if (found) {
+      return adv;
+    }
+  }
+  // Tier 3: fallback total-miss (or fallback not registered as an SD font) ->
+  // primary's replacement glyph advance, matching resolveGlyph tier-3 /
+  // EpdFont::getGlyph.
+  const EpdGlyph* repl = font.getGlyph(cp, style);
+  return repl ? repl->advanceX : 0;
+}
+
 void GfxRenderer::ensureSdCardFontReady(int fontId, const char* utf8Text, uint8_t styleMask) const {
   auto it = sdCardFonts_.find(fontId);
   if (it != sdCardFonts_.end()) {
@@ -462,9 +496,11 @@ int GfxRenderer::getTextWidth(const int fontId, const char* text, const EpdFontF
       widthPx += fp4::toPixel(prevAdvanceFP + kernFP);
     }
 
-    // Resolve once; read advance then discard before the next resolve.
-    const ResolvedGlyph resolved = resolveGlyph(fontId, font, cp, style);
-    prevAdvanceFP = resolved.glyph ? resolved.glyph->advanceX : 0;
+    // Advance-only: read the advance for cp without loading its bitmap. Mirrors
+    // resolveGlyph's tier-1/2/3 advance exactly, but the UI->CJK fallback tier
+    // (tier 2) reads ONLY advanceX from SD instead of loading the full glyph,
+    // which is what makes CJK file-list width measurement fast.
+    prevAdvanceFP = measureGlyphAdvanceFP(fontId, font, cp, style);
     if ((style & (EpdFontFamily::SUP | EpdFontFamily::SUB)) != 0) {
       prevAdvanceFP = (prevAdvanceFP + 1) / 2;
     }
@@ -1376,12 +1412,179 @@ std::string GfxRenderer::truncatedText(const int fontId, const char* text, const
   std::string item = text;
   // U+2026 HORIZONTAL ELLIPSIS (UTF-8: 0xE2 0x80 0xA6)
   const char* ellipsis = "\xe2\x80\xa6";
+  static constexpr uint32_t kEllipsisCp = 0x2026;
   int textWidth = getTextWidth(fontId, item.c_str(), style);
   if (textWidth <= maxWidth) {
-    // Text fits, return as is
+    // Text fits, return as is. (Byte-identical early-out, unchanged.)
     return item;
   }
 
+  // ---- O(L) fast path ---------------------------------------------------------
+  // The legacy loop below is O(L^2): each utf8RemoveLastChar re-measures the whole
+  // string, and on a fallback-eligible CJK font every getTextWidth pass walks the
+  // glyphs (loading bitmaps via resolveGlyph in the old code). For a folder of Han
+  // titles that is brutally slow. Replace it with a single L->R advance-only walk
+  // that records each prefix's cumulative width, then one backward scan to pick the
+  // longest prefix that fits with the ellipsis.
+  //
+  // Eligibility (else fall through to the legacy loop for byte-identical results):
+  //   * Fallback-eligible font only. For non-eligible fonts getTextWidth() measures
+  //     via the bbox path (getTextDimensions), NOT the advance walk, so this
+  //     advance-accumulating fast path would diverge.
+  //   * No RTL lead bytes (0xD6-0xD7 Hebrew, 0xD8-0xDB Arabic/Syriac). The legacy
+  //     code truncates the LOGICAL string but measures the bidi-VISUAL order; for
+  //     pure-LTR text resolveVisualText() is identity so logical == visual and the
+  //     fast path is exact. RTL falls back to the legacy loop.
+  //   * Prefix fits the fixed stack array (no heap in this UI hot path).
+  const bool fallbackEligible = uiFallbackFontId_ != 0 && isUiFallbackEligible(fontId);
+  bool hasRtl = false;
+  for (const unsigned char* q = reinterpret_cast<const unsigned char*>(item.c_str()); *q; ++q) {
+    if (*q >= 0xD6 && *q <= 0xDB) {
+      hasRtl = true;
+      break;
+    }
+  }
+
+  if (fallbackEligible && !hasRtl) {
+    const auto fontIt = fontMap.find(fontId);
+    if (fontIt != fontMap.end()) {
+      const auto& font = fontIt->second;
+      const bool isSupSub = (style & (EpdFontFamily::SUP | EpdFontFamily::SUB)) != 0;
+
+      // Per-prefix snapshot: the cumulative width and the running differential
+      // state AT the prefix boundary (byteOffset). widthRunning is the loop's
+      // accumulator BEFORE flushing the final glyph; prevAdvanceFP/lastCp are the
+      // state needed to append the ellipsis byte-identically to
+      // getTextWidth(prefix + ellipsis). See the width derivation below.
+      struct PrefixState {
+        size_t byteOffset;     // byte length of the prefix (post-ligature cut point)
+        int widthRunning;      // accumulated px before final-glyph flush
+        int32_t prevAdvanceFP;  // last glyph's advance (SUP/SUB scaled), 12.4 FP
+        uint32_t lastCp;        // last effective codepoint (for ellipsis boundary kern)
+      };
+      static constexpr uint32_t kMaxPrefixes = 128;
+      PrefixState prefixes[kMaxPrefixes];
+      uint32_t prefixCount = 0;
+
+      // Stage advance misses for ONE batched write-back (mirror getTextAdvanceX):
+      // getAdvanceOrFetch(..., &fetched) skips its own per-cp merge so we avoid a
+      // table realloc per codepoint; we merge once at the end.
+      SdCardFont::AdvanceEntryPublic missStage[64];
+      uint32_t missCount = 0;
+      const auto sdFallbackIt = sdCardFonts_.find(uiFallbackFontId_);
+      SdCardFont* sdFallback = (sdFallbackIt != sdCardFonts_.end()) ? sdFallbackIt->second : nullptr;
+      const uint8_t fallbackStyleIdx = sdFallback ? sdFallback->resolveFamilyStyle(static_cast<uint8_t>(style)) : 0;
+
+      const char* textCursor = item.c_str();
+      const char* base = textCursor;
+      uint32_t cp;
+      uint32_t prevCp = 0;
+      int widthRunning = 0;       // accumulator BEFORE final-glyph flush
+      int32_t prevAdvanceFP = 0;  // 12.4 FP, SUP/SUB scaled
+      bool overCap = false;
+
+      while ((cp = utf8NextCodepoint(reinterpret_cast<const uint8_t**>(&textCursor)))) {
+        // Skip Hebrew Niqqud and combining marks (no advance) — match getTextWidth.
+        // No prefix snapshot is recorded for a skipped cp; the cut point can only
+        // land at a base/effective codepoint, which is what the width walk measures.
+        if (cp >= 0x0591 && cp <= 0x05C7) continue;
+        if (utf8IsCombiningMark(cp)) continue;
+
+        cp = font.applyLigatures(cp, textCursor, style);
+
+        // Differential rounding: snap (previous advance + current kern) together.
+        if (prevCp != 0) {
+          const auto kernFP = font.getKerning(prevCp, cp, style);
+          widthRunning += fp4::toPixel(prevAdvanceFP + kernFP);
+        }
+
+        // Advance-only source for this cp (tier 1/2/3), identical to getTextWidth.
+        // For the fallback (tier 2) we defer write-back and stage the miss.
+        int32_t advFP;
+        if (const EpdGlyph* g = font.tryGetGlyph(cp, style)) {
+          advFP = g->advanceX;
+        } else if (sdFallback) {
+          bool found = false;
+          bool fetched = false;
+          const uint16_t a = sdFallback->getAdvanceOrFetch(cp, static_cast<uint8_t>(style), found, &fetched);
+          if (found) {
+            advFP = a;
+            if (fetched && missCount < (sizeof(missStage) / sizeof(missStage[0]))) {
+              // Dedup against already-staged (runs are short; staged set is small).
+              bool seen = false;
+              for (uint32_t m = 0; m < missCount; m++) {
+                if (missStage[m].codepoint == cp) {
+                  seen = true;
+                  break;
+                }
+              }
+              if (!seen) {
+                missStage[missCount].codepoint = cp;
+                missStage[missCount].advanceX = a;
+                missCount++;
+              }
+            }
+          } else {
+            const EpdGlyph* repl = font.getGlyph(cp, style);  // tier 3: primary replacement
+            advFP = repl ? repl->advanceX : 0;
+          }
+        } else {
+          const EpdGlyph* repl = font.getGlyph(cp, style);
+          advFP = repl ? repl->advanceX : 0;
+        }
+        if (isSupSub) advFP = (advFP + 1) / 2;
+
+        prevAdvanceFP = advFP;
+        prevCp = cp;
+
+        if (prefixCount >= kMaxPrefixes) {
+          overCap = true;
+          break;
+        }
+        prefixes[prefixCount].byteOffset = static_cast<size_t>(textCursor - base);
+        prefixes[prefixCount].widthRunning = widthRunning;
+        prefixes[prefixCount].prevAdvanceFP = prevAdvanceFP;
+        prefixes[prefixCount].lastCp = prevCp;
+        prefixCount++;
+      }
+
+      // One batched write-back of all freshly-fetched fallback advances.
+      if (sdFallback && missCount > 0) {
+        std::sort(missStage, missStage + missCount,
+                  [](const SdCardFont::AdvanceEntryPublic& a, const SdCardFont::AdvanceEntryPublic& b) {
+                    return a.codepoint < b.codepoint;
+                  });
+        sdFallback->cacheAdvances(fallbackStyleIdx, missStage, missCount);
+      }
+
+      if (!overCap) {
+        // Ellipsis tail advance (single glyph, SUP/SUB scaled like a measured cp).
+        int32_t ellipsisAdvFP = measureGlyphAdvanceFP(fontId, font, kEllipsisCp, style);
+        if (isSupSub) ellipsisAdvFP = (ellipsisAdvFP + 1) / 2;
+        const int ellipsisFlushPx = fp4::toPixel(ellipsisAdvFP);
+
+        // width(prefix + ellipsis), byte-identical to getTextWidth(prefix+ellipsis):
+        //   widthRunning(prefix)                              // accumulated steps
+        //   + toPixel(prevAdvanceFP(prefix) + kern(lastCp, U+2026))  // boundary step
+        //   + toPixel(advance(U+2026))                        // final flush
+        // Pick the LARGEST prefix with that total < maxWidth (matches the legacy
+        // ">= maxWidth -> remove" loop, which keeps the longest prefix that is < ).
+        for (int i = static_cast<int>(prefixCount) - 1; i >= 0; --i) {
+          const PrefixState& ps = prefixes[i];
+          const auto boundaryKernFP = font.getKerning(ps.lastCp, kEllipsisCp, style);
+          const int full = ps.widthRunning + fp4::toPixel(ps.prevAdvanceFP + boundaryKernFP) + ellipsisFlushPx;
+          if (full < maxWidth) {
+            return item.substr(0, ps.byteOffset) + ellipsis;
+          }
+        }
+        // No prefix fits -> just the ellipsis (matches item.empty() branch below).
+        return ellipsis;
+      }
+      // overCap: fall through to the legacy loop (rare: title > 128 codepoints).
+    }
+  }
+
+  // ---- Legacy O(L^2) fallback (byte-identical) --------------------------------
   while (!item.empty() && getTextWidth(fontId, (item + ellipsis).c_str(), style) >= maxWidth) {
     utf8RemoveLastChar(item);
   }
@@ -1697,9 +1900,10 @@ int GfxRenderer::getTextAdvanceX(const int fontId, const char* text, EpdFontFami
       widthPx += fp4::toPixel(prevAdvanceFP + kernFP);         // snap 12.4 fixed-point to nearest pixel
     }
 
-    // Resolve once (primary / CJK fallback / replacement); consume before next.
-    const ResolvedGlyph resolved = resolveGlyph(fontId, font, cp, style);
-    prevAdvanceFP = resolved.glyph ? resolved.glyph->advanceX : 0;
+    // Advance-only (primary / CJK fallback advance / replacement). Byte-identical
+    // to resolveGlyph's advance, but the fallback tier reads ONLY advanceX from
+    // SD instead of loading the glyph bitmap. This is a measurement-only walk.
+    prevAdvanceFP = measureGlyphAdvanceFP(fontId, font, cp, style);
     if ((style & (EpdFontFamily::SUP | EpdFontFamily::SUB)) != 0) {
       prevAdvanceFP = (prevAdvanceFP + 1) / 2;
     }
