@@ -2,8 +2,17 @@
 
 #include <cstdint>
 #include <cstring>
+#include <memory>
+#include <new>
 
 struct BmpHeader;
+
+// Upper bounds on a decoded image's pixel dimensions. Beyond these the dither/scale
+// working set (error rows sized by width, buffers by width*height) risks OOM on the
+// ~380KB heap, so the PNG/JPEG/BMP converters reject the image instead. Defined once
+// here — all three converters include this header.
+constexpr int MAX_IMAGE_WIDTH = 2048;
+constexpr int MAX_IMAGE_HEIGHT = 3072;
 
 // Helper functions
 uint8_t quantize(int gray, int x, int y);
@@ -23,10 +32,14 @@ void createBmpHeader(BmpHeader* bmpHeader, int width, int height, BmpRowOrder ro
 //     1/8
 class Atkinson1BitDitherer {
  public:
-  explicit Atkinson1BitDitherer(int width) : width(width) {
-    errorRow0 = new int16_t[width + 4]();  // Current row
-    errorRow1 = new int16_t[width + 4]();  // Next row
-    errorRow2 = new int16_t[width + 4]();  // Row after next
+  // Factory: a constructor cannot signal OOM under -fno-exceptions (a failed
+  // allocation in the ctor would abort()). Allocate via this nothrow factory and
+  // null-check the result instead. Returns nullptr if any error row can't be
+  // allocated.
+  static std::unique_ptr<Atkinson1BitDitherer> make(int width) {
+    std::unique_ptr<Atkinson1BitDitherer> d(new (std::nothrow) Atkinson1BitDitherer(width));
+    if (!d || !d->init()) return nullptr;
+    return d;
   }
 
   ~Atkinson1BitDitherer() {
@@ -90,10 +103,22 @@ class Atkinson1BitDitherer {
   }
 
  private:
+  explicit Atkinson1BitDitherer(int width) : width(width) {}
+
+  // Allocate the three error rows. Returns false on OOM (nothrow new). Called
+  // only by make(); rows left non-null only if all succeed (destructor frees any
+  // partial allocation).
+  bool init() {
+    errorRow0 = new (std::nothrow) int16_t[width + 4]();  // Current row
+    errorRow1 = new (std::nothrow) int16_t[width + 4]();  // Next row
+    errorRow2 = new (std::nothrow) int16_t[width + 4]();  // Row after next
+    return errorRow0 && errorRow1 && errorRow2;
+  }
+
   int width;
-  int16_t* errorRow0;
-  int16_t* errorRow1;
-  int16_t* errorRow2;
+  int16_t* errorRow0 = nullptr;
+  int16_t* errorRow1 = nullptr;
+  int16_t* errorRow2 = nullptr;
 };
 
 // Atkinson dithering - distributes only 6/8 (75%) of error for cleaner results
@@ -104,10 +129,14 @@ class Atkinson1BitDitherer {
 // Less error buildup = fewer artifacts than Floyd-Steinberg
 class AtkinsonDitherer {
  public:
-  explicit AtkinsonDitherer(int width) : width(width) {
-    errorRow0 = new int16_t[width + 4]();  // Current row
-    errorRow1 = new int16_t[width + 4]();  // Next row
-    errorRow2 = new int16_t[width + 4]();  // Row after next
+  // Factory: a constructor cannot signal OOM under -fno-exceptions (a failed
+  // allocation in the ctor would abort()). Allocate via this nothrow factory and
+  // null-check the result instead. Returns nullptr if any error row can't be
+  // allocated.
+  static std::unique_ptr<AtkinsonDitherer> make(int width) {
+    std::unique_ptr<AtkinsonDitherer> d(new (std::nothrow) AtkinsonDitherer(width));
+    if (!d || !d->init()) return nullptr;
+    return d;
   }
 
   ~AtkinsonDitherer() {
@@ -189,10 +218,21 @@ class AtkinsonDitherer {
   }
 
  private:
+  explicit AtkinsonDitherer(int width) : width(width) {}
+
+  // Allocate the three error rows. Returns false on OOM (nothrow new). Called
+  // only by make(); destructor frees any partial allocation.
+  bool init() {
+    errorRow0 = new (std::nothrow) int16_t[width + 4]();  // Current row
+    errorRow1 = new (std::nothrow) int16_t[width + 4]();  // Next row
+    errorRow2 = new (std::nothrow) int16_t[width + 4]();  // Row after next
+    return errorRow0 && errorRow1 && errorRow2;
+  }
+
   int width;
-  int16_t* errorRow0;
-  int16_t* errorRow1;
-  int16_t* errorRow2;
+  int16_t* errorRow0 = nullptr;
+  int16_t* errorRow1 = nullptr;
+  int16_t* errorRow2 = nullptr;
 };
 
 // Floyd-Steinberg error diffusion dithering with serpentine scanning
@@ -205,9 +245,14 @@ class AtkinsonDitherer {
 //      7/16  X
 class FloydSteinbergDitherer {
  public:
-  explicit FloydSteinbergDitherer(int width) : width(width), rowCount(0) {
-    errorCurRow = new int16_t[width + 2]();  // +2 for boundary handling
-    errorNextRow = new int16_t[width + 2]();
+  // Factory: a constructor cannot signal OOM under -fno-exceptions (a failed
+  // allocation in the ctor would abort()). Allocate via this nothrow factory and
+  // null-check the result instead. Returns nullptr if any error row can't be
+  // allocated.
+  static std::unique_ptr<FloydSteinbergDitherer> make(int width) {
+    std::unique_ptr<FloydSteinbergDitherer> d(new (std::nothrow) FloydSteinbergDitherer(width));
+    if (!d || !d->init()) return nullptr;
+    return d;
   }
 
   ~FloydSteinbergDitherer() {
@@ -315,8 +360,19 @@ class FloydSteinbergDitherer {
   }
 
  private:
+  explicit FloydSteinbergDitherer(int width) : width(width), rowCount(0) {}
+
+  // Allocate the two error rows (+2 each for boundary handling). Returns false on
+  // OOM (nothrow new). Called only by make(); destructor frees any partial
+  // allocation.
+  bool init() {
+    errorCurRow = new (std::nothrow) int16_t[width + 2]();
+    errorNextRow = new (std::nothrow) int16_t[width + 2]();
+    return errorCurRow && errorNextRow;
+  }
+
   int width;
   int rowCount;
-  int16_t* errorCurRow;
-  int16_t* errorNextRow;
+  int16_t* errorCurRow = nullptr;
+  int16_t* errorNextRow = nullptr;
 };

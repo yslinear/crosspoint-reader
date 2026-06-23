@@ -1,5 +1,7 @@
 #include "Bitmap.h"
 
+#include <ErrorReport.h>
+
 #include <cstdlib>
 #include <cstring>
 
@@ -16,9 +18,7 @@ constexpr bool USE_ATKINSON = true;  // Use Atkinson dithering instead of Floyd-
 Bitmap::~Bitmap() {
   delete[] errorCurRow;
   delete[] errorNextRow;
-
-  delete atkinsonDitherer;
-  delete fsDitherer;
+  // atkinsonDitherer / fsDitherer are std::unique_ptr — freed automatically.
 }
 
 uint16_t Bitmap::readLE16(HalFile& f) {
@@ -76,6 +76,8 @@ const char* Bitmap::errorToString(BmpReaderError err) {
 
     case BmpReaderError::OomRowBuffer:
       return "OomRowBuffer";
+    case BmpReaderError::OomDitherer:
+      return "OomDitherer";
     case BmpReaderError::ShortReadRow:
       return "ShortReadRow";
   }
@@ -121,9 +123,7 @@ BmpReaderError Bitmap::parseHeaders() {
 
   if (width <= 0 || height <= 0) return BmpReaderError::BadDimensions;
 
-  // Safety limits to prevent memory issues on ESP32
-  constexpr int MAX_IMAGE_WIDTH = 2048;
-  constexpr int MAX_IMAGE_HEIGHT = 3072;
+  // Dimension limits MAX_IMAGE_WIDTH/HEIGHT come from BitmapHelpers.h (via Bitmap.h).
   if (width > MAX_IMAGE_WIDTH || height > MAX_IMAGE_HEIGHT) {
     return BmpReaderError::ImageTooLarge;
   }
@@ -167,10 +167,13 @@ BmpReaderError Bitmap::parseHeaders() {
   //  - High-color + dithering disabled → simple quantization (no error diffusion)
   const bool highColor = !nativePalette;
   if (highColor && dithering) {
+    // make() is the nothrow factory: a ctor can't signal OOM under -fno-exceptions.
     if (USE_ATKINSON) {
-      atkinsonDitherer = new AtkinsonDitherer(width);
+      atkinsonDitherer = AtkinsonDitherer::make(width);
+      if (!atkinsonDitherer) return BmpReaderError::OomDitherer;
     } else {
-      fsDitherer = new FloydSteinbergDitherer(width);
+      fsDitherer = FloydSteinbergDitherer::make(width);
+      if (!fsDitherer) return BmpReaderError::OomDitherer;
     }
   }
 

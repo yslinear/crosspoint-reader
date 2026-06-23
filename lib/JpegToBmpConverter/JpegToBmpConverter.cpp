@@ -1,5 +1,6 @@
 #include "JpegToBmpConverter.h"
 
+#include <ErrorReport.h>
 #include <HalDisplay.h>
 #include <HalStorage.h>
 #include <JPEGDEC.h>
@@ -392,12 +393,18 @@ bool JpegToBmpConverter::jpegFileToBmpStreamInternal(HalFile& jpegFile, Print& b
     LOG_ERR("JPG", "Not enough heap for JPEG decoder (%u free, need %u)", ESP.getFreeHeap(), MIN_FREE_HEAP);
     return false;
   }
+  // The JPEG decoder is one ~20 KB contiguous allocation, so the largest free block
+  // (getMaxAllocHeap) decides success, not total free.
+  if (ESP.getMaxAllocHeap() < JPEG_DECODER_SIZE) {
+    LOG_ERR_OOM("JPG", "JPEG decoder", JPEG_DECODER_SIZE);
+    return false;
+  }
 
   s_jpegFile = &jpegFile;
 
   const auto jpeg = makeUniqueNoThrow<JPEGDEC>();
   if (!jpeg) {
-    LOG_ERR("JPG", "OOM: JPEG decoder");
+    LOG_ERR_OOM("JPG", "JPEG decoder", JPEG_DECODER_SIZE);
     return false;
   }
 
@@ -422,8 +429,6 @@ bool JpegToBmpConverter::jpegFileToBmpStreamInternal(HalFile& jpegFile, Print& b
     LOG_DBG("JPG", "Progressive JPEG decode uses 1/8 source: %dx%d", decodedSrcWidth, decodedSrcHeight);
   }
 
-  constexpr int MAX_IMAGE_WIDTH = 2048;
-  constexpr int MAX_IMAGE_HEIGHT = 3072;
 
   if (srcWidth <= 0 || srcHeight <= 0 || srcWidth > MAX_IMAGE_WIDTH || srcHeight > MAX_IMAGE_HEIGHT) {
     LOG_DBG("JPG", "Image too large or invalid (%dx%d), max supported: %dx%d", srcWidth, srcHeight, MAX_IMAGE_WIDTH,
@@ -522,23 +527,28 @@ bool JpegToBmpConverter::jpegFileToBmpStreamInternal(HalFile& jpegFile, Print& b
     ctx.nextOutY_srcStart = scaleY_fp;
   }
 
+  // Use the nothrow ::make() factory, not makeUniqueNoThrow<T>(): the ditherer
+  // allocates its error rows internally, so wrapping the object in
+  // makeUniqueNoThrow alone would not catch an OOM in those internal rows (the
+  // ctor would abort under -fno-exceptions). The factory allocates the rows via
+  // nothrow new and returns nullptr if any row fails.
   if (oneBit) {
-    ctx.atkinson1BitDitherer = makeUniqueNoThrow<Atkinson1BitDitherer>(outWidth);
+    ctx.atkinson1BitDitherer = Atkinson1BitDitherer::make(outWidth);
     if (!ctx.atkinson1BitDitherer) {
-      LOG_ERR("JPG", "OOM: Atkinson1BitDitherer");
+      LOG_ERR_OOM("JPG", "Atkinson1Bit ditherer", 3u * (outWidth + 4) * sizeof(int16_t));
       return false;
     }
   } else if (!USE_8BIT_OUTPUT) {
     if (USE_ATKINSON) {
-      ctx.atkinsonDitherer = makeUniqueNoThrow<AtkinsonDitherer>(outWidth);
+      ctx.atkinsonDitherer = AtkinsonDitherer::make(outWidth);
       if (!ctx.atkinsonDitherer) {
-        LOG_ERR("JPG", "OOM: AtkinsonDitherer");
+        LOG_ERR_OOM("JPG", "Atkinson ditherer", 3u * (outWidth + 4) * sizeof(int16_t));
         return false;
       }
     } else if (USE_FLOYD_STEINBERG) {
-      ctx.fsDitherer = makeUniqueNoThrow<FloydSteinbergDitherer>(outWidth);
+      ctx.fsDitherer = FloydSteinbergDitherer::make(outWidth);
       if (!ctx.fsDitherer) {
-        LOG_ERR("JPG", "OOM: FloydSteinbergDitherer");
+        LOG_ERR_OOM("JPG", "FloydSteinberg ditherer", 2u * (outWidth + 2) * sizeof(int16_t));
         return false;
       }
     }

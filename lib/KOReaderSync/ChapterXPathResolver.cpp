@@ -14,6 +14,13 @@
 #include <vector>
 
 namespace {
+// Hard cap on XML element nesting depth. Real EPUB/HTML content nests a few dozen
+// levels deep at most; a runaway count means malformed or adversarial markup that
+// would otherwise grow the path/parentStates stacks without bound (~380KB heap).
+// On hit we stop growing the stacks but keep counting depth so end-element pops
+// stay balanced. Generous so it never trips on a legitimate document.
+constexpr int MAX_NESTING_DEPTH = 256;
+
 std::string stripPrefix(const XML_Char* name) {
   if (!name) {
     return "";
@@ -262,6 +269,17 @@ class XPathParagraphResolver final : public Print {
   }
 
   void onStartElement(const XML_Char* rawName) {
+    // Nesting cap: stop growing path/parentStates once we exceed the depth limit.
+    // depth keeps incrementing so the matching onEndElement depth-- stays balanced.
+    if (depth >= MAX_NESTING_DEPTH) {
+      if (!depthCapReported) {
+        LOG_ERR("KOX", "Nesting depth cap hit (%d), stopping stack growth", MAX_NESTING_DEPTH);
+        depthCapReported = true;
+      }
+      depth++;
+      return;
+    }
+
     const std::string name = stripPrefix(rawName);
 
     if (!insideBody) {
@@ -305,6 +323,12 @@ class XPathParagraphResolver final : public Print {
       return;
     }
 
+    // If the matching start element was capped (its depth was at/above the limit),
+    // it never pushed onto the stacks, so we must not pop here.
+    if (depth >= MAX_NESTING_DEPTH) {
+      return;
+    }
+
     if (!path.empty()) {
       path.pop_back();
     }
@@ -318,6 +342,7 @@ class XPathParagraphResolver final : public Print {
   bool parseOk = true;
   bool insideBody = false;
   bool stopped = false;
+  bool depthCapReported = false;
   int depth = 0;
   int bodyDepth = -1;
   int paragraphCount = 0;
@@ -396,6 +421,18 @@ class XPathProgressResolver final : public Print {
   }
 
   void onStartElement(const XML_Char* rawName) {
+    // Nesting cap: stop growing path/parentStates/textNodeIndexStack once we exceed
+    // the depth limit. depth keeps incrementing so the matching onEndElement depth--
+    // stays balanced.
+    if (depth >= MAX_NESTING_DEPTH) {
+      if (!depthCapReported) {
+        LOG_ERR("KOX", "Nesting depth cap hit (%d), stopping stack growth", MAX_NESTING_DEPTH);
+        depthCapReported = true;
+      }
+      depth++;
+      return;
+    }
+
     const std::string name = stripPrefix(rawName);
 
     if (!insideBody) {
@@ -437,6 +474,12 @@ class XPathProgressResolver final : public Print {
       parentStates.clear();
       path.clear();
       textNodeIndexStack.clear();
+      return;
+    }
+
+    // If the matching start element was capped (its depth was at/above the limit),
+    // it never pushed onto the stacks, so we must not pop here.
+    if (depth >= MAX_NESTING_DEPTH) {
       return;
     }
 
@@ -502,6 +545,7 @@ class XPathProgressResolver final : public Print {
   bool insideBody = false;
   bool stopped = false;
   bool pendingTextNode = true;
+  bool depthCapReported = false;  // log the nesting-depth cap once (used by onStartElement)
   int depth = 0;
   int bodyDepth = -1;
   int paragraphDepth = 0;

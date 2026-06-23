@@ -57,6 +57,7 @@ enum class BmpReaderError : uint8_t {
   SeekPixelDataFailed,
   BufferTooSmall,
   OomRowBuffer,
+  OomDitherer,  // ditherer factory (make()) returned null under heap pressure
   ShortReadRow,
 };
 
@@ -98,6 +99,9 @@ class Bitmap {
   mutable int16_t* errorNextRow = nullptr;
   mutable int prevRowY = -1;  // Track row progression for error propagation
 
-  mutable AtkinsonDitherer* atkinsonDitherer = nullptr;
-  mutable FloydSteinbergDitherer* fsDitherer = nullptr;
+  // unique_ptr so the nothrow make() factory result is owned and freed automatically
+  // (the dtor's "freed automatically" note relies on this). Complete types come from
+  // BitmapHelpers.h, included by this header.
+  mutable std::unique_ptr<AtkinsonDitherer> atkinsonDitherer;
+  mutable std::unique_ptr<FloydSteinbergDitherer> fsDitherer;
 };

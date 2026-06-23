@@ -15,6 +15,15 @@
 
 namespace xtc {
 
+// Generous cap on the chapter table. chapterCount is derived from on-disk offsets
+// (available / chapterSize) and a corrupt/oversized file can inflate it toward
+// fileSize/96 (~175k entries for a 16MB file). Clamp before reserve()/the read
+// loop so a bad file can never drive a pathological allocation on the ~380KB
+// heap. On hit we truncate (keep the first MAX_XTC_CHAPTERS), never abort.
+namespace {
+constexpr size_t MAX_XTC_CHAPTERS = 8192;
+}  // namespace
+
 XtcParser::XtcParser()
     : m_isOpen(false),
       m_defaultWidth(DISPLAY_WIDTH),
@@ -313,9 +322,16 @@ XtcError XtcParser::readChapters() {
 
   constexpr size_t chapterSize = 96;
   const uint64_t available = maxOffset - chapterOffset;
-  const size_t chapterCount = static_cast<size_t>(available / chapterSize);
+  size_t chapterCount = static_cast<size_t>(available / chapterSize);
   if (chapterCount == 0) {
     return XtcError::OK;
+  }
+
+  // chapterCount is derived from untrusted on-disk offsets. Truncate to the
+  // generous cap so a corrupt file can't drive a pathological reserve()/loop.
+  if (chapterCount > MAX_XTC_CHAPTERS) {
+    LOG_ERR("XTC", "chapter count %zu exceeds cap (%zu), truncating", chapterCount, MAX_XTC_CHAPTERS);
+    chapterCount = MAX_XTC_CHAPTERS;
   }
 
   if (!m_file.seek64(chapterOffset)) {

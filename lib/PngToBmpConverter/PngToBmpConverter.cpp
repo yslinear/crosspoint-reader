@@ -1,9 +1,11 @@
 #include "PngToBmpConverter.h"
 
+#include <ErrorReport.h>
 #include <HalDisplay.h>
 #include <HalStorage.h>
 #include <InflateReader.h>
 #include <Logging.h>
+#include <Memory.h>
 
 #include <cstdio>
 #include <cstring>
@@ -443,9 +445,7 @@ bool PngToBmpConverter::pngFileToBmpStreamInternal(HalFile& pngFile, Print& bmpO
     return false;
   }
 
-  // Safety limits
-  constexpr int MAX_IMAGE_WIDTH = 2048;
-  constexpr int MAX_IMAGE_HEIGHT = 3072;
+  // Dimension limits MAX_IMAGE_WIDTH/HEIGHT come from BitmapHelpers.h.
 
   if (width > MAX_IMAGE_WIDTH || height > MAX_IMAGE_HEIGHT || width == 0 || height == 0) {
     LOG_ERR("PNG", "Image too large or zero (%ux%u)", width, height);
@@ -613,52 +613,80 @@ bool PngToBmpConverter::pngFileToBmpStreamInternal(HalFile& pngFile, Print& bmpO
   // Allocate BMP row buffer
   auto* rowBuffer = static_cast<uint8_t*>(malloc(bytesPerRow));
   if (!rowBuffer) {
-    LOG_ERR("PNG", "Failed to allocate row buffer");
+    LOG_ERR_OOM("PNG", "BMP row buffer", bytesPerRow);
     free(ctx.currentRow);
     free(ctx.previousRow);
     return false;
   }
 
-  // Create ditherers (same as JpegToBmpConverter)
-  AtkinsonDitherer* atkinsonDitherer = nullptr;
-  FloydSteinbergDitherer* fsDitherer = nullptr;
-  Atkinson1BitDitherer* atkinson1BitDitherer = nullptr;
-
-  if (oneBit) {
-    atkinson1BitDitherer = new Atkinson1BitDitherer(outWidth);
-  } else if (!USE_8BIT_OUTPUT) {
-    if (USE_ATKINSON) {
-      atkinsonDitherer = new AtkinsonDitherer(outWidth);
-    } else if (USE_FLOYD_STEINBERG) {
-      fsDitherer = new FloydSteinbergDitherer(outWidth);
-    }
-  }
-
-  // Scaling accumulators
+  // Scaling accumulators (declared before the cleanup so the lambda can free them
+  // regardless of which bail path is taken). Initialized to nullptr; allocated
+  // below only when scaling is needed.
   uint32_t* rowAccum = nullptr;
   uint16_t* rowCount = nullptr;
   int currentOutY = 0;
   uint32_t nextOutY_srcStart = 0;
 
-  if (needsScaling) {
-    rowAccum = new uint32_t[outWidth]();
-    rowCount = new uint16_t[outWidth]();
-    nextOutY_srcStart = scaleY_fp;
-  }
+  // Grayscale row buffer - batch-convert each scanline to avoid per-pixel
+  // getPixelGray() switch overhead in the hot loops. Allocated below.
+  uint8_t* grayRow = nullptr;
 
-  // Allocate grayscale row buffer - batch-convert each scanline to avoid
-  // per-pixel getPixelGray() switch overhead in the hot loops
-  auto* grayRow = static_cast<uint8_t*>(malloc(width));
-  if (!grayRow) {
-    LOG_ERR("PNG", "Failed to allocate grayscale row buffer");
+  // Single cleanup for all malloc/new[] buffers in this function tail. free() and
+  // delete[] on nullptr are no-ops, so registering before the later allocations
+  // is safe on every bail path. The ditherers below are std::unique_ptr (RAII) and
+  // are NOT listed here. Replaces the former hand-written delete[]/free() ladder.
+  ScopedCleanup cleanup{[&] {
+    free(grayRow);
     delete[] rowAccum;
     delete[] rowCount;
-    delete atkinsonDitherer;
-    delete fsDitherer;
-    delete atkinson1BitDitherer;
     free(rowBuffer);
     free(ctx.currentRow);
     free(ctx.previousRow);
+  }};
+
+  // Create ditherers (same as JpegToBmpConverter). The factory is nothrow and
+  // returns nullptr on OOM (a ctor cannot signal OOM under -fno-exceptions); bail
+  // gracefully rather than abort. unique_ptr frees automatically.
+  std::unique_ptr<AtkinsonDitherer> atkinsonDitherer;
+  std::unique_ptr<FloydSteinbergDitherer> fsDitherer;
+  std::unique_ptr<Atkinson1BitDitherer> atkinson1BitDitherer;
+
+  if (oneBit) {
+    atkinson1BitDitherer = Atkinson1BitDitherer::make(outWidth);
+    if (!atkinson1BitDitherer) {
+      LOG_ERR_OOM("PNG", "Atkinson1Bit ditherer", 3u * (outWidth + 4) * sizeof(int16_t));
+      return false;
+    }
+  } else if (!USE_8BIT_OUTPUT) {
+    if (USE_ATKINSON) {
+      atkinsonDitherer = AtkinsonDitherer::make(outWidth);
+      if (!atkinsonDitherer) {
+        LOG_ERR_OOM("PNG", "Atkinson ditherer", 3u * (outWidth + 4) * sizeof(int16_t));
+        return false;
+      }
+    } else if (USE_FLOYD_STEINBERG) {
+      fsDitherer = FloydSteinbergDitherer::make(outWidth);
+      if (!fsDitherer) {
+        LOG_ERR_OOM("PNG", "FloydSteinberg ditherer", 2u * (outWidth + 2) * sizeof(int16_t));
+        return false;
+      }
+    }
+  }
+
+  if (needsScaling) {
+    rowAccum = new (std::nothrow) uint32_t[outWidth]();
+    rowCount = new (std::nothrow) uint16_t[outWidth]();
+    if (!rowAccum || !rowCount) {
+      LOG_ERR_OOM("PNG", "scaling accumulators", (size_t)outWidth * (sizeof(uint32_t) + sizeof(uint16_t)));
+      return false;
+    }
+    nextOutY_srcStart = scaleY_fp;
+  }
+
+  // Allocate grayscale row buffer
+  grayRow = static_cast<uint8_t*>(malloc(width));
+  if (!grayRow) {
+    LOG_ERR_OOM("PNG", "grayscale row buffer", width);
     return false;
   }
 
@@ -803,17 +831,7 @@ bool PngToBmpConverter::pngFileToBmpStreamInternal(HalFile& pngFile, Print& bmpO
     ctx.currentRow = temp;
   }
 
-  // Clean up
-  free(grayRow);
-  delete[] rowAccum;
-  delete[] rowCount;
-  delete atkinsonDitherer;
-  delete fsDitherer;
-  delete atkinson1BitDitherer;
-  free(rowBuffer);
-  free(ctx.currentRow);
-  free(ctx.previousRow);
-
+  // Buffers freed by ScopedCleanup; ditherers freed by unique_ptr.
   if (success) {
     LOG_DBG("PNG", "Successfully converted PNG to BMP");
   }

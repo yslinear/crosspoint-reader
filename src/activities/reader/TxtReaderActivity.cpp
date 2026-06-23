@@ -22,6 +22,18 @@ constexpr size_t CHUNK_SIZE = 8 * 1024;  // 8KB chunk for reading
 // Cache file magic and version
 constexpr uint32_t CACHE_MAGIC = 0x54585449;  // "TXTI"
 constexpr uint8_t CACHE_VERSION = 3;          // Increment when cache format changes
+// Generous cap on indexed pages. A 131072-page TXT is already absurd (hundreds of MB);
+// the cap mainly guards the cache-load path, where an untrusted on-disk page count would
+// otherwise drive an enormous reserve() and crash on the ~380KB heap. pageOffsets is a
+// vector<size_t> (4 bytes/entry on this 32-bit target), so the cap also bounds the worst-
+// case reserve: 16384 * 4 = 64KB. 16384 pages is a ~32MB single text file — far beyond any
+// realistic .txt, so this never truncates legitimate content.
+constexpr size_t MAX_TXT_PAGES = 16384;
+// Compile-time regression guard: pageOffsets.reserve(numPages) with numPages up to the
+// cap must not request an unsafe contiguous block on the ~380KB heap. Keep cap * entry
+// size within ~128KB. (This caught a real bug where the cap was 131072 -> 512KB reserve.)
+static_assert(MAX_TXT_PAGES * sizeof(size_t) <= 128 * 1024,
+              "MAX_TXT_PAGES * sizeof(entry) exceeds a safe heap reserve");
 }  // namespace
 
 void TxtReaderActivity::onEnter() {
@@ -159,6 +171,10 @@ void TxtReaderActivity::buildPageIndex() {
 
     offset = nextOffset;
     if (offset < fileSize) {
+      if (pageOffsets.size() >= MAX_TXT_PAGES) {
+        LOG_ERR("TRS", "Page index hit cap (%zu), truncating", MAX_TXT_PAGES);
+        break;
+      }
       pageOffsets.push_back(offset);
     }
 
@@ -528,6 +544,14 @@ bool TxtReaderActivity::loadPageIndexCache() {
 
   uint32_t numPages;
   serialization::readPod(f, numPages);
+
+  // numPages comes straight off disk and is untrusted. Reject a corrupt cache whose
+  // count exceeds the generous cap before reserve(), so we never attempt a multi-GB
+  // allocation on the ~380KB heap (rebuilds the index from scratch instead).
+  if (numPages > MAX_TXT_PAGES) {
+    LOG_ERR("TRS", "Cache page count %u exceeds cap (%zu), rebuilding", numPages, MAX_TXT_PAGES);
+    return false;
+  }
 
   // Read page offsets
   pageOffsets.clear();
