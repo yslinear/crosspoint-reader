@@ -991,11 +991,11 @@ void GfxRenderer::drawIcon(const uint8_t bitmap[], const int x, const int y, con
 }
 
 void GfxRenderer::drawBitmap(const Bitmap& bitmap, const int x, const int y, const int maxWidth, const int maxHeight,
-                             const float cropX, const float cropY) const {
+                             const float cropX, const float cropY, const bool allowUpscale) const {
   if (fontCacheManager_ && fontCacheManager_->isScanning()) return;
   // For 1-bit bitmaps, use optimized 1-bit rendering path (no crop support for 1-bit)
   if (bitmap.is1Bit() && cropX == 0.0f && cropY == 0.0f) {
-    drawBitmap1Bit(bitmap, x, y, maxWidth, maxHeight);
+    drawBitmap1Bit(bitmap, x, y, maxWidth, maxHeight, allowUpscale);
     return;
   }
 
@@ -1022,7 +1022,7 @@ void GfxRenderer::drawBitmap(const Bitmap& bitmap, const int x, const int y, con
     hasTargetBounds = true;
   }
 
-  if (hasTargetBounds && fitScale < 1.0f) {
+  if (hasTargetBounds && (fitScale < 1.0f || allowUpscale)) {
     scale = fitScale;
     isScaled = true;
   }
@@ -1041,16 +1041,38 @@ void GfxRenderer::drawBitmap(const Bitmap& bitmap, const int x, const int y, con
     return;
   }
 
+  // When upscaling (scale > 1) the source-pixel-driven nearest-neighbour map leaves gaps between
+  // consecutive destination pixels. Fill the destination SPAN [screen, nextScreen) so the scaled-up image
+  // is solid rather than a sparse grid. For scale <= 1 the span collapses to a single pixel (unchanged).
+  const bool upscaling = isScaled && scale > 1.0f;
   for (int bmpY = 0; bmpY < (bitmap.getHeight() - cropPixY); bmpY++) {
     // The BMP's (0, 0) is the bottom-left corner (if the height is positive, top-left if negative).
     // Screen's (0, 0) is the top-left corner.
-    int screenY = -cropPixY + (bitmap.isTopDown() ? bmpY : bitmap.getHeight() - 1 - bmpY);
+    const int srcY = -cropPixY + (bitmap.isTopDown() ? bmpY : bitmap.getHeight() - 1 - bmpY);
+    int screenY = srcY;
     if (isScaled) {
       screenY = std::floor(screenY * scale);
     }
     screenY += y;  // the offset should not be scaled
     if (screenY >= getScreenHeight()) {
       break;
+    }
+
+    // Destination row span: the next source row (bmpY+1) maps to nextRowScreenY; fill the half-open gap
+    // between this row and it so no screen row is left blank. The span direction is whatever sign the map
+    // produces (bottom-up bitmaps run screen-upward, top-down run screen-downward).
+    int screenYLo = screenY;
+    int screenYHi = screenY;
+    if (upscaling) {
+      const int nextSrcY = -cropPixY + (bitmap.isTopDown() ? bmpY + 1 : bitmap.getHeight() - 1 - (bmpY + 1));
+      const int nextRowScreenY = std::floor(nextSrcY * scale) + y;
+      if (nextRowScreenY > screenY) {
+        screenYHi = nextRowScreenY - 1;
+      } else if (nextRowScreenY < screenY) {
+        screenYLo = nextRowScreenY + 1;
+      }
+      if (screenYLo < 0) screenYLo = 0;
+      if (screenYHi >= getScreenHeight()) screenYHi = getScreenHeight() - 1;
     }
 
     if (bitmap.readNextRow(outputRow, rowBytes) != BmpReaderError::Ok) {
@@ -1082,14 +1104,35 @@ void GfxRenderer::drawBitmap(const Bitmap& bitmap, const int x, const int y, con
         continue;
       }
 
+      // Destination column span (collapses to one pixel when not upscaling).
+      int screenXEnd = screenX;
+      if (upscaling) {
+        const int nextScreenX = std::floor((bmpX - cropPixX + 1) * scale) + x;
+        screenXEnd = std::max(screenX, nextScreenX - 1);
+        if (screenXEnd >= getScreenWidth()) screenXEnd = getScreenWidth() - 1;
+      }
+
       const uint8_t val = outputRow[bmpX / 4] >> (6 - ((bmpX * 2) % 8)) & 0x3;
 
+      bool draw = false;
+      bool state = true;
       if (renderMode == BW && val < 3) {
-        drawPixel(screenX, screenY);
+        draw = true;
+        state = true;
       } else if (renderMode == GRAYSCALE_MSB && (val == 1 || val == 2)) {
-        drawPixel(screenX, screenY, false);
+        draw = true;
+        state = false;
       } else if (renderMode == GRAYSCALE_LSB && val == 1) {
-        drawPixel(screenX, screenY, false);
+        draw = true;
+        state = false;
+      }
+
+      if (draw) {
+        for (int sy = screenYLo; sy <= screenYHi; sy++) {
+          for (int sx = screenX; sx <= screenXEnd; sx++) {
+            drawPixel(sx, sy, state);
+          }
+        }
       }
     }
   }
@@ -1099,15 +1142,25 @@ void GfxRenderer::drawBitmap(const Bitmap& bitmap, const int x, const int y, con
 }
 
 void GfxRenderer::drawBitmap1Bit(const Bitmap& bitmap, const int x, const int y, const int maxWidth,
-                                 const int maxHeight) const {
+                                 const int maxHeight, const bool allowUpscale) const {
   float scale = 1.0f;
   bool isScaled = false;
-  if (maxWidth > 0 && bitmap.getWidth() > maxWidth) {
-    scale = static_cast<float>(maxWidth) / static_cast<float>(bitmap.getWidth());
-    isScaled = true;
+
+  // Compute the aspect-fit ratio against whichever bounds are present. When allowUpscale is false the
+  // bitmap is only ever scaled DOWN (fitScale < 1.0f); when true it is also scaled UP to fill the bounds.
+  bool hasTargetBounds = false;
+  float fitScale = 1.0f;
+  if (maxWidth > 0 && bitmap.getWidth() > 0) {
+    fitScale = static_cast<float>(maxWidth) / static_cast<float>(bitmap.getWidth());
+    hasTargetBounds = true;
   }
-  if (maxHeight > 0 && bitmap.getHeight() > maxHeight) {
-    scale = std::min(scale, static_cast<float>(maxHeight) / static_cast<float>(bitmap.getHeight()));
+  if (maxHeight > 0 && bitmap.getHeight() > 0) {
+    const float heightScale = static_cast<float>(maxHeight) / static_cast<float>(bitmap.getHeight());
+    fitScale = hasTargetBounds ? std::min(fitScale, heightScale) : heightScale;
+    hasTargetBounds = true;
+  }
+  if (hasTargetBounds && (fitScale < 1.0f || allowUpscale)) {
+    scale = fitScale;
     isScaled = true;
   }
 
@@ -1123,6 +1176,10 @@ void GfxRenderer::drawBitmap1Bit(const Bitmap& bitmap, const int x, const int y,
     return;
   }
 
+  // When upscaling, fill the destination SPAN between consecutive source pixels so the enlarged image is
+  // solid rather than a sparse grid (see the 2-bit path for the same fix). Collapses to single pixels when
+  // scale <= 1, so the down-scale and native-size paths are byte-for-byte unchanged.
+  const bool upscaling = isScaled && scale > 1.0f;
   for (int bmpY = 0; bmpY < bitmap.getHeight(); bmpY++) {
     // Read rows sequentially using readNextRow
     if (bitmap.readNextRow(outputRow, rowBytes) != BmpReaderError::Ok) {
@@ -1142,6 +1199,21 @@ void GfxRenderer::drawBitmap1Bit(const Bitmap& bitmap, const int x, const int y,
       continue;
     }
 
+    // Destination row span: fill the half-open gap toward the next source row (bmpY+1).
+    int screenYLo = screenY;
+    int screenYHi = screenY;
+    if (upscaling) {
+      const int nextBmpYOffset = bitmap.isTopDown() ? bmpY + 1 : bitmap.getHeight() - 1 - (bmpY + 1);
+      const int nextRowScreenY = y + static_cast<int>(std::floor(nextBmpYOffset * scale));
+      if (nextRowScreenY > screenY) {
+        screenYHi = nextRowScreenY - 1;
+      } else if (nextRowScreenY < screenY) {
+        screenYLo = nextRowScreenY + 1;
+      }
+      if (screenYLo < 0) screenYLo = 0;
+      if (screenYHi >= getScreenHeight()) screenYHi = getScreenHeight() - 1;
+    }
+
     for (int bmpX = 0; bmpX < bitmap.getWidth(); bmpX++) {
       int screenX = x + (isScaled ? static_cast<int>(std::floor(bmpX * scale)) : bmpX);
       if (screenX >= getScreenWidth()) {
@@ -1151,13 +1223,25 @@ void GfxRenderer::drawBitmap1Bit(const Bitmap& bitmap, const int x, const int y,
         continue;
       }
 
+      // Destination column span (collapses to one pixel when not upscaling).
+      int screenXEnd = screenX;
+      if (upscaling) {
+        const int nextScreenX = x + static_cast<int>(std::floor((bmpX + 1) * scale));
+        screenXEnd = std::max(screenX, nextScreenX - 1);
+        if (screenXEnd >= getScreenWidth()) screenXEnd = getScreenWidth() - 1;
+      }
+
       // Get 2-bit value (result of readNextRow quantization)
       const uint8_t val = outputRow[bmpX / 4] >> (6 - ((bmpX * 2) % 8)) & 0x3;
 
       // For 1-bit source: 0 or 1 -> map to black (0,1,2) or white (3)
       // val < 3 means black pixel (draw it)
       if (val < 3) {
-        drawPixel(screenX, screenY, true);
+        for (int sy = screenYLo; sy <= screenYHi; sy++) {
+          for (int sx = screenX; sx <= screenXEnd; sx++) {
+            drawPixel(sx, sy, true);
+          }
+        }
       }
       // White pixels (val == 3) are not drawn (leave background)
     }
@@ -1545,13 +1629,46 @@ int GfxRenderer::getTextAdvanceX(const int fontId, const char* text, EpdFontFami
       return 0;
     }
     const auto& font = fontIt->second;
+    // #1 write-back: when an advance misses the cached table we read it from SD
+    // via getGlyph()'s glyph-miss path. Stage those (codepoint, advance) pairs
+    // and merge them into the SD font's advance table once at the end of the
+    // scan, so the same CJK glyph is read from SD at most once per font lifetime
+    // instead of on every layout pass. Fixed staging buffer (no heap in the hot
+    // loop); overflow beyond it is simply not written back this scan (the next
+    // pass re-stages it — bounded, correct).
+    SdCardFont::AdvanceEntryPublic missStage[64];
+    uint32_t missCount = 0;
     while (uint32_t cp = utf8NextCodepoint(reinterpret_cast<const uint8_t**>(&text))) {
       int32_t advFP = sdIt->second->getAdvance(cp, styleIdx);
       if (advFP == 0 && !utf8IsCombiningMark(cp)) {
         const EpdGlyph* glyph = font.getGlyph(cp, style);
         advFP = glyph ? glyph->advanceX : 0;
+        if (glyph) {
+          // Stage for write-back unless already staged this scan (dedup keeps
+          // the staged set sorted-after-sort unique; tiny linear scan, runs are
+          // short). Skip if the staging buffer is full.
+          bool seen = false;
+          for (uint32_t m = 0; m < missCount; m++) {
+            if (missStage[m].codepoint == cp) {
+              seen = true;
+              break;
+            }
+          }
+          if (!seen && missCount < (sizeof(missStage) / sizeof(missStage[0]))) {
+            missStage[missCount].codepoint = cp;
+            missStage[missCount].advanceX = static_cast<uint16_t>(advFP);
+            missCount++;
+          }
+        }
       }
       widthFP += isSupSub ? (advFP + 1) / 2 : advFP;
+    }
+    if (missCount > 0) {
+      std::sort(missStage, missStage + missCount,
+                [](const SdCardFont::AdvanceEntryPublic& a, const SdCardFont::AdvanceEntryPublic& b) {
+                  return a.codepoint < b.codepoint;
+                });
+      sdIt->second->cacheAdvances(styleIdx, missStage, missCount);
     }
     return fp4::toPixel(widthFP);
   }
