@@ -1402,7 +1402,12 @@ void GfxRenderer::invertScreen() const {
 void GfxRenderer::displayBuffer(const HalDisplay::RefreshMode refreshMode) const {
   auto elapsed = millis() - start_ms;
   LOG_DBG("GFX", "Time = %lu ms from clearScreen to displayBuffer", elapsed);
-  display.displayBuffer(refreshMode, fadingFix);
+  HalDisplay::RefreshMode mode = refreshMode;
+  if (hasNextRefreshOverride_) {
+    mode = nextRefreshOverride_;  // manual "Refresh Screen" forces the ghost-cleanup waveform
+    hasNextRefreshOverride_ = false;  // one-shot
+  }
+  display.displayBuffer(mode, fadingFix);
 }
 
 std::string GfxRenderer::truncatedText(const int fontId, const char* text, const int maxWidth,

@@ -74,6 +74,10 @@ class GfxRenderer {
   mutable int _stripRows = 0;
   mutable bool _stripActive = false;
 
+  // One-shot refresh-mode override for the next displayBuffer() (manual refresh).
+  mutable HalDisplay::RefreshMode nextRefreshOverride_ = HalDisplay::FAST_REFRESH;
+  mutable bool hasNextRefreshOverride_ = false;
+
   // UI->CJK glyph fallback. When non-zero, identifies an SD-card font family
   // (registered in fontMap/sdCardFonts_) consulted for any codepoint the
   // primary UI font lacks. 0 = no fallback (every miss draws the primary's
@@ -194,6 +198,14 @@ class GfxRenderer {
   int getScreenWidth() const;
   int getScreenHeight() const;
   void displayBuffer(HalDisplay::RefreshMode refreshMode = HalDisplay::FAST_REFRESH) const;
+  // Override the refresh mode of the NEXT displayBuffer() call (one-shot, then
+  // self-clears). Used by the manual "Refresh Screen" shortcut to re-render the
+  // current page (so grayscale is re-applied) while forcing that paint onto the
+  // HALF ghost-cleanup waveform instead of the usual fast refresh.
+  void overrideNextRefreshMode(HalDisplay::RefreshMode mode) const {
+    nextRefreshOverride_ = mode;
+    hasNextRefreshOverride_ = true;
+  }
   // EXPERIMENTAL: Windowed update - display only a rectangular region
   // void displayWindow(int x, int y, int width, int height) const;
   void invertScreen() const;
