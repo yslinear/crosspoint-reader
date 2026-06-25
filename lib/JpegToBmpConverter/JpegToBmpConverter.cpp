@@ -173,19 +173,17 @@ constexpr uint32_t FP_ONE = 1UL << 16;
 // to service open/read/seek for the decode in progress.
 //
 // This pointer (and the JPEGDEC instance + per-decode ctx) is process-global, so
-// two tasks decoding at once would clobber it: the prio-0 BackgroundWorker
-// cover-gen job (handleGenerateCover -> Epub::generateThumbBmp) runs on the worker
-// task WITHOUT the RenderLock, while HomeActivity::loadRecentCovers runs the same
-// converter on the render task. They are NOT serialized by any existing lock, so
-// jpegFileToBmpStreamInternal — the single decode entry point that assigns
-// s_jpegFile and drives JPEGDEC — must take its own mutex (s_decodeMutex below).
+// two tasks decoding at once would clobber it. Decodes are not serialized by any
+// existing lock, so jpegFileToBmpStreamInternal — the single decode entry point
+// that assigns s_jpegFile and drives JPEGDEC — must take its own mutex
+// (s_decodeMutex below) to be safe against any concurrent decode.
 static HalFile* s_jpegFile = nullptr;
 
 // Serializes every decode that touches the process-global s_jpegFile / JPEGDEC
 // state. Created eagerly at startup via initDecodeMutex() (single-threaded, before
 // any task can decode); the lazy create in DecodeLock is a belt-and-suspenders
-// fallback. A foreground (render-task) decode waits at most one in-flight worker
-// decode; cover/thumb decodes are infrequent, so this bounded wait is acceptable.
+// fallback. A decode waits at most one other in-flight decode; cover/thumb
+// decodes are infrequent, so this bounded wait is acceptable.
 static SemaphoreHandle_t s_decodeMutex = nullptr;
 
 // RAII guard for s_decodeMutex. Takes the mutex at construction (creating it
