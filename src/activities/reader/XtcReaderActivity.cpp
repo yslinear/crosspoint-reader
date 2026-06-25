@@ -19,11 +19,22 @@
 #include "CrossPointState.h"
 #include "MappedInputManager.h"
 #include "ProgressFile.h"
+#include "ReaderShortcutDecision.h"
 #include "ReaderUtils.h"
 #include "RecentBooksStore.h"
 #include "XtcReaderChapterSelectionActivity.h"
+#include "XtcStatusBarDecision.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
+
+// Lock the pure xtcsb::overlayFor() literals to the real enum values so the
+// host-testable decision header stays in sync with CrossPointSettings.
+static_assert(static_cast<int>(CrossPointSettings::XTC_STATUS_BAR_MODE::XTC_STATUS_BAR_HIDE) == 0,
+              "xtcsb::overlayFor HIDE literal out of sync");
+static_assert(static_cast<int>(CrossPointSettings::XTC_STATUS_BAR_MODE::XTC_STATUS_BAR_BOTTOM) == 1,
+              "xtcsb::overlayFor BOTTOM literal out of sync");
+static_assert(static_cast<int>(CrossPointSettings::XTC_STATUS_BAR_MODE::XTC_STATUS_BAR_TOP) == 2,
+              "xtcsb::overlayFor TOP literal out of sync");
 
 void XtcReaderActivity::onEnter() {
   Activity::onEnter();
@@ -68,17 +79,24 @@ void XtcReaderActivity::loop() {
     }
   }
 
-  // Long press BACK (1s+) goes to file selection
-  if (mappedInput.isPressed(MappedInputManager::Button::Back) && mappedInput.getHeldTime() >= ReaderUtils::GO_HOME_MS) {
-    activityManager.goToFileBrowser(xtc ? xtc->getPath() : "");
-    return;
-  }
-
-  // Short press BACK goes directly to home
-  if (mappedInput.wasReleased(MappedInputManager::Button::Back) &&
-      mappedInput.getHeldTime() < ReaderUtils::GO_HOME_MS) {
-    onGoHome();
-    return;
+  // BACK held-button ladder resolved by the pure core (long-press -> file
+  // browser, short-press -> home). Thresholds live in rdr::resolveHeldButtonAction.
+  {
+    const bool backPressed = mappedInput.isPressed(MappedInputManager::Button::Back);
+    const bool backReleased = mappedInput.wasReleased(MappedInputManager::Button::Back);
+    if (backPressed || backReleased) {
+      const rdr::HeldAction backAction = rdr::resolveHeldButtonAction(
+          rdr::HeldButton::Back, mappedInput.getHeldTime(), backReleased, SETTINGS.longPressButtonBehavior,
+          SETTINGS.longPressMenuFunction, /*pageTurnTriggered=*/false);
+      if (backAction == rdr::HeldAction::FileBrowser) {
+        activityManager.goToFileBrowser(xtc ? xtc->getPath() : "");
+        return;
+      }
+      if (backAction == rdr::HeldAction::GoHome) {
+        onGoHome();
+        return;
+      }
+    }
   }
 
   const auto [prevTriggered, nextTriggered, fromTilt] = ReaderUtils::detectPageTurn(mappedInput);
@@ -97,8 +115,14 @@ void XtcReaderActivity::loop() {
     return;
   }
 
-  const bool skipPages = !fromTilt && SETTINGS.longPressButtonBehavior == SETTINGS.CHAPTER_SKIP &&
-                         mappedInput.getHeldTime() > ReaderUtils::SKIP_HOLD_MS;
+  // Page-turn-gated chapter-skip resolved by the pure core. A tilt-driven turn is
+  // never a long-press skip, so gate the core on !fromTilt (the pure core has no
+  // tilt concept). pageTurnTriggered is true here (we returned above otherwise).
+  const bool skipPages =
+      !fromTilt &&
+      rdr::resolveHeldButtonAction(rdr::HeldButton::PageTurn, mappedInput.getHeldTime(), /*released=*/false,
+                                   SETTINGS.longPressButtonBehavior, SETTINGS.longPressMenuFunction,
+                                   /*pageTurnTriggered=*/true) == rdr::HeldAction::ChapterSkip;
   const int skipAmount = skipPages ? 10 : 1;
 
   if (prevTriggered) {
@@ -162,18 +186,19 @@ XtcReaderActivity::StatusBarInfo XtcReaderActivity::getStatusBarInfo() const {
                        static_cast<int>(chapterIt->endPage - chapterIt->startPage) + 1, std::move(title)};
 }
 
-void XtcReaderActivity::renderStatusBarOverlay(const StatusBarOverlayPosition position) const {
+XtcReaderActivity::StatusBarBand XtcReaderActivity::renderStatusBarOverlay(
+    const StatusBarOverlayPosition position) const {
   const bool drawBottom = SETTINGS.xtcStatusBarMode == CrossPointSettings::XTC_STATUS_BAR_MODE::XTC_STATUS_BAR_BOTTOM &&
                           position == StatusBarOverlayPosition::Bottom;
   const bool drawTop = SETTINGS.xtcStatusBarMode == CrossPointSettings::XTC_STATUS_BAR_MODE::XTC_STATUS_BAR_TOP &&
                        position == StatusBarOverlayPosition::Top;
   if (!drawBottom && !drawTop) {
-    return;
+    return {};
   }
 
   const int statusBarHeight = UITheme::getInstance().getStatusBarHeight();
   if (statusBarHeight <= 0) {
-    return;
+    return {};
   }
 
   int orientedMarginTop, orientedMarginRight, orientedMarginBottom, orientedMarginLeft;
@@ -203,6 +228,32 @@ void XtcReaderActivity::renderStatusBarOverlay(const StatusBarOverlayPosition po
   const float progress = pageCount > 0 ? (static_cast<float>(displayPage) * 100.0f) / pageCount : 0.0f;
   const auto pageInfo = getStatusBarInfo();
   GUI.drawStatusBar(renderer, progress, pageInfo.currentPage, pageInfo.pageCount, pageInfo.title, paddingBottom);
+
+  // The bar's drawn pixels (clear fill + drawStatusBar content) all land inside
+  // the logical-Y span [clearY, clearY+clearHeight). Return it so the grayscale
+  // passes can leave these BW pixels untouched.
+  return clearHeight > 0 ? StatusBarBand{clearY, clearY + clearHeight} : StatusBarBand{};
+}
+
+XtcReaderActivity::StatusBarBand XtcReaderActivity::drawConfiguredStatusBarOverlay() const {
+  // Single funnel for every 2-bit (XTH) render path. The status bar is drawn
+  // into the BW framebuffer BEFORE the page's one and only display, exactly like
+  // the 1-bit XTC path (renderStatusBarOverlay then displayWithRefreshCycle) and
+  // EPUB (renderStatusBar before its single display). This removes the second
+  // FAST_REFRESH that previously made the bar land a beat late on grayscale
+  // pages. The returned band lets the LSB/MSB grayscale passes leave the bar
+  // pixels untouched, so displayGrayBuffer drives only page-content gray and the
+  // BW bar survives (the EPUB outcome, achieved by exclusion). The overlay
+  // position is decided by the pure, host-tested xtcsb::overlayFor().
+  switch (xtcsb::overlayFor(SETTINGS.xtcStatusBarMode)) {
+    case xtcsb::Overlay::Top:
+      return renderStatusBarOverlay(StatusBarOverlayPosition::Top);
+    case xtcsb::Overlay::Bottom:
+      return renderStatusBarOverlay(StatusBarOverlayPosition::Bottom);
+    case xtcsb::Overlay::None:
+      return {};
+  }
+  return {};
 }
 
 void XtcReaderActivity::renderPage() {
@@ -321,12 +372,20 @@ void XtcReaderActivity::renderPage() {
       }
     }
 
+    // Fold the status bar into the BW framebuffer BEFORE the single display, so
+    // the bar appears in lockstep with the page with no extra refresh. The
+    // returned band marks the logical-Y rows the bar occupies; the grayscale
+    // passes skip those rows so neither plane drives them and displayGrayBuffer
+    // leaves the BW bar intact.
+    const StatusBarBand barBand = drawConfiguredStatusBarOverlay();
+
     ReaderUtils::displayWithRefreshCycle(renderer, pagesUntilFullRefresh);
 
     // Pass 2: LSB buffer - mark DARK gray only (XTH value 1)
     // In LUT: 0 bit = apply gray effect, 1 bit = untouched
     renderer.clearScreen(0x00);
     for (uint16_t y = 0; y < pageHeight; y++) {
+      if (barBand.contains(y)) continue;  // leave the BW status bar untouched
       for (uint16_t x = 0; x < pageWidth; x++) {
         if (getPixelValue(x, y) == 1) {  // Dark grey only
           renderer.drawPixel(x, y, false);
@@ -339,6 +398,7 @@ void XtcReaderActivity::renderPage() {
     // In LUT: 0 bit = apply gray effect, 1 bit = untouched
     renderer.clearScreen(0x00);
     for (uint16_t y = 0; y < pageHeight; y++) {
+      if (barBand.contains(y)) continue;  // leave the BW status bar untouched
       for (uint16_t x = 0; x < pageWidth; x++) {
         const uint8_t pv = getPixelValue(x, y);
         if (pv == 1 || pv == 2) {  // Dark grey or Light grey
@@ -351,7 +411,9 @@ void XtcReaderActivity::renderPage() {
     // Display grayscale overlay
     renderer.displayGrayBuffer();
 
-    // Pass 4: Re-render BW to framebuffer (restore for next frame, instead of restoreBwBuffer)
+    // Pass 4: Re-render BW to framebuffer (restore for next frame, instead of
+    // restoreBwBuffer). Re-draw the status bar too so the next differential page
+    // turn diffs against a framebuffer that still includes the bar.
     renderer.clearScreen();
     for (uint16_t y = 0; y < pageHeight; y++) {
       for (uint16_t x = 0; x < pageWidth; x++) {
@@ -359,6 +421,9 @@ void XtcReaderActivity::renderPage() {
           renderer.drawPixel(x, y, true);
         }
       }
+    }
+    if (!barBand.empty()) {
+      drawConfiguredStatusBarOverlay();
     }
 
     // Cleanup grayscale buffers with current frame buffer
@@ -512,6 +577,14 @@ bool XtcReaderActivity::renderPage2BitBanded(uint16_t pageWidth, uint16_t pageHe
       }
     });
   }
+
+  // Fold the status bar into the BW framebuffer BEFORE the single display, so the
+  // bar appears in lockstep with the page with no extra refresh (mirrors the
+  // 1-bit XTC path and EPUB). The returned logical-Y band tells the LSB/MSB strip
+  // passes which rows to skip; the strip passes write only to scratch, so leaving
+  // those rows unmarked means displayGrayBuffer drives no gray there and the BW
+  // bar in the framebuffer survives.
+  const StatusBarBand barBand = drawConfiguredStatusBarOverlay();
   ReaderUtils::displayWithRefreshCycle(renderer, pagesUntilFullRefresh);
 
   // Pass 2: LSB plane (DarkGrey only, value 1) streamed straight to controller.
@@ -526,6 +599,7 @@ bool XtcReaderActivity::renderPage2BitBanded(uint16_t pageWidth, uint16_t pageHe
     renderer.beginStripTarget(scratch.get(), y, rows);
     renderer.clearScreen(0x00);
     forEachInBand(y, rows, [&](uint16_t x, uint16_t yy) {
+      if (barBand.contains(yy)) return;  // leave the BW status bar untouched
       if (bandPixel(x, yy) == 1) {
         renderer.drawPixel(x, yy, false);
       }
@@ -546,6 +620,7 @@ bool XtcReaderActivity::renderPage2BitBanded(uint16_t pageWidth, uint16_t pageHe
     renderer.beginStripTarget(scratch.get(), y, rows);
     renderer.clearScreen(0x00);
     forEachInBand(y, rows, [&](uint16_t x, uint16_t yy) {
+      if (barBand.contains(yy)) return;  // leave the BW status bar untouched
       const uint8_t pv = bandPixel(x, yy);
       if (pv == 1 || pv == 2) {
         renderer.drawPixel(x, yy, false);
@@ -557,8 +632,9 @@ bool XtcReaderActivity::renderPage2BitBanded(uint16_t pageWidth, uint16_t pageHe
 
   renderer.setRenderMode(GfxRenderer::BW);
   renderer.displayGrayBuffer();
-  // BW framebuffer from Pass 1 is intact (strip passes wrote only to scratch);
-  // re-sync controller RAM for the next differential page turn directly from it.
+  // BW framebuffer from Pass 1 (page + status bar) is intact (strip passes wrote
+  // only to scratch); re-sync controller RAM for the next differential page turn
+  // directly from it.
   renderer.cleanupGrayscaleWithFrameBuffer();
 
   LOG_DBG("XTR", "Rendered page %lu/%lu (2-bit grayscale, banded)", currentPage + 1, xtc->getPageCount());
