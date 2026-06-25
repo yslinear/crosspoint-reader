@@ -56,9 +56,6 @@ class EpubReaderActivity final : public Activity {
                       int orientedMarginBottom, int orientedMarginLeft);
   void renderStatusBar() const;
   void silentIndexNextChapterIfNeeded(uint16_t viewportWidth, uint16_t viewportHeight);
-  // Copy the page's unique codepoints (UTF-8) and enqueue a background glyph
-  // prewarm (Job 3). Only meaningful for SD-card reader fonts; caller checks.
-  void enqueueGlyphPrewarmForPage(const Page& page, int fontId);
   bool saveProgress(int spineIndex, int currentPage, int pageCount);
   // Jump to a percentage of the book (0-100), mapping it to spine and page.
   void jumpToPercent(int percent);

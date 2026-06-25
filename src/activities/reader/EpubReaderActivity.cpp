@@ -1,6 +1,5 @@
 #include "EpubReaderActivity.h"
 
-#include <BackgroundWorker.h>
 #include <Epub/Page.h>
 #include <Epub/blocks/TextBlock.h>
 #include <FontCacheManager.h>
@@ -32,6 +31,7 @@
 #include "MappedInputManager.h"
 #include "ProgressMapper.h"
 #include "QrDisplayActivity.h"
+#include "ReaderShortcutDecision.h"
 #include "ReaderUtils.h"
 #include "RecentBooksStore.h"
 #include "components/UITheme.h"
@@ -167,49 +167,12 @@ void EpubReaderActivity::onEnter() {
   APP_STATE.saveToFile();
   RECENT_BOOKS.addBook(epub->getPath(), epub->getTitle(), epub->getAuthor(), epub->getThumbBmpPath());
 
-  // Background jobs: bind the worker's context to THIS book so any stale job from
-  // a previously open book is dropped (S5). The hash mirrors the Epub cache key.
-  const uint32_t bookHash = static_cast<uint32_t>(std::hash<std::string>{}(epub->getPath()));
-  BG_WORKER.setContext(bookHash);
-
-  // JOB 1 (cover gen): if the home-screen thumbnail is not cached yet, ask the
-  // worker to build it while we read, instead of stalling the next Home entry
-  // (deferred start S6, heap-gated S4, chunked SD S2 — all inside the worker).
-  const int coverHeight = UITheme::getInstance().getMetrics().homeCoverHeight;
-  if (!Storage.exists(epub->getThumbBmpPath(coverHeight).c_str())) {
-    BG_WORKER.enqueueCoverGen(epub->getPath().c_str(), bookHash, coverHeight);
-  }
-
   // Trigger first update
   requestUpdate();
 }
 
 void EpubReaderActivity::onExit() {
   Activity::onExit();
-
-  // Drop any queued/in-flight background jobs for this book before we tear down
-  // (S5). The worker copies paths and owns its own Epub, so this is belt-and-
-  // suspenders, but it stops a now-pointless chapter index from running after we
-  // leave and frees the worker for the next activity immediately.
-  BG_WORKER.cancelAll();
-
-  // FIX 4: release the prewarmed SD-font glyph bitmaps before leaving the book.
-  // The glyph-prewarm job (JOB 3) writes mini-bitmaps into the process-lifetime
-  // SdCardFont objects (renderer.getSdCardFonts()). The foreground PrewarmScope
-  // clears them on each page render, but if a prewarm ran after the last render,
-  // those bitmaps would otherwise persist in the global font across the NEXT
-  // book/session (a cross-session leak). onExit runs under the global RenderLock
-  // (ActivityManager::exitActivity), and cancelAll() above has already asked the
-  // in-flight prewarm to abort, so this clear is race-free against the worker.
-  // clearPrewarm() frees the prewarm mini-bitmaps but PRESERVES the SD fonts'
-  // on-demand overflow rings — those cache UI / file-browser CJK glyphs, and the
-  // old clearCache() here wiped them, leaving CJK file lists cold and very slow
-  // after every reading session. releasePrewarmHeld() drops the worker's
-  // held-byte accounting so kMaxHeldBytes starts the next session from zero.
-  if (auto* fcm = renderer.getFontCacheManager()) {
-    fcm->clearPrewarm();
-  }
-  BG_WORKER.releasePrewarmHeld();
 
   // Reset orientation back to portrait for the rest of the UI
   renderer.setOrientation(GfxRenderer::Orientation::Portrait);
@@ -334,49 +297,54 @@ void EpubReaderActivity::loop() {
   }
 
   // Long-press Confirm runs the user-selected function (SETTINGS.longPressMenuFunction).
+  // The held-time -> intent decision is resolved by the pure core; the loop keeps
+  // ownership of the side effects (ignoreNextConfirmRelease, bookmark message
+  // state) and the KoSync fall-through-to-menu recovery.
   if (mappedInput.isPressed(MappedInputManager::Button::Confirm)) {
-    switch (SETTINGS.longPressMenuFunction) {
-      case CrossPointSettings::LP_MENU_BOOKMARK:
-        // Hold ~0.4s drops a bookmark at the current page.
-        if (mappedInput.getHeldTime() >= ReaderUtils::BOOKMARK_HOLD_MS && !showBookmarkMessage) {
-          addBookmark();
-          showBookmarkMessage = true;
-          ignoreNextConfirmRelease = true;  // Prevent accidental menu open after adding bookmark
-          bookmarkMessageTime = millis();
-          requestUpdate();
-        }
-        break;
-      case CrossPointSettings::LP_MENU_KOSYNC:
-        // Hold ~1s launches KOReader sync. If sync can't run (no credentials stored), fall
-        // through so the normal Confirm-release still opens the reader menu.
-        if (mappedInput.getHeldTime() >= ReaderUtils::GO_HOME_MS) {
-          if (launchKOReaderSync()) {
-            ignoreNextConfirmRelease = true;  // sync launched or error shown; suppress menu open
-            return;
-          }
-        }
-        break;
-      case CrossPointSettings::LP_MENU_DISABLED:
-      default:
-        break;
+    const rdr::HeldAction confirmAction = rdr::resolveHeldButtonAction(
+        rdr::HeldButton::Confirm, mappedInput.getHeldTime(), /*released=*/false, SETTINGS.longPressButtonBehavior,
+        SETTINGS.longPressMenuFunction, /*pageTurnTriggered=*/false);
+    if (confirmAction == rdr::HeldAction::Bookmark) {
+      // Hold ~0.4s drops a bookmark at the current page.
+      if (!showBookmarkMessage) {
+        addBookmark();
+        showBookmarkMessage = true;
+        ignoreNextConfirmRelease = true;  // Prevent accidental menu open after adding bookmark
+        bookmarkMessageTime = millis();
+        requestUpdate();
+      }
+    } else if (confirmAction == rdr::HeldAction::KoSync) {
+      // Hold ~1s launches KOReader sync. If sync can't run (no credentials stored), fall
+      // through so the normal Confirm-release still opens the reader menu.
+      if (launchKOReaderSync()) {
+        ignoreNextConfirmRelease = true;  // sync launched or error shown; suppress menu open
+        return;
+      }
     }
   }
 
-  // Long press BACK (1s+) goes to file selection
-  if (mappedInput.isPressed(MappedInputManager::Button::Back) && mappedInput.getHeldTime() >= ReaderUtils::GO_HOME_MS) {
-    activityManager.goToFileBrowser(epub ? epub->getPath() : "");
-    return;
-  }
-
-  // Short press BACK goes directly to home (or restores position if viewing footnote)
-  if (mappedInput.wasReleased(MappedInputManager::Button::Back) &&
-      mappedInput.getHeldTime() < ReaderUtils::GO_HOME_MS) {
-    if (footnoteDepth > 0) {
-      restoreSavedPosition();
-      return;
+  // BACK held-button ladder resolved by the pure core (long-press -> file browser,
+  // short-press -> home/restore footnote position).
+  {
+    const bool backPressed = mappedInput.isPressed(MappedInputManager::Button::Back);
+    const bool backReleased = mappedInput.wasReleased(MappedInputManager::Button::Back);
+    if (backPressed || backReleased) {
+      const rdr::HeldAction backAction = rdr::resolveHeldButtonAction(
+          rdr::HeldButton::Back, mappedInput.getHeldTime(), backReleased, SETTINGS.longPressButtonBehavior,
+          SETTINGS.longPressMenuFunction, /*pageTurnTriggered=*/false);
+      if (backAction == rdr::HeldAction::FileBrowser) {
+        activityManager.goToFileBrowser(epub ? epub->getPath() : "");
+        return;
+      }
+      if (backAction == rdr::HeldAction::GoHome) {
+        if (footnoteDepth > 0) {
+          restoreSavedPosition();
+          return;
+        }
+        onGoHome();
+        return;
+      }
     }
-    onGoHome();
-    return;
   }
 
   // auto [prevTriggered, nextTriggered] = ReaderUtils::detectPageTurn(mappedInput);
@@ -423,14 +391,22 @@ void EpubReaderActivity::loop() {
     return;
   }
 
-  const bool longPress = !fromTilt && mappedInput.getHeldTime() > ReaderUtils::SKIP_HOLD_MS;
+  // Page-turn-gated long-press behavior (chapter skip / orientation change),
+  // resolved by the pure core. A tilt-driven turn is never a long-press, so gate
+  // on !fromTilt (the pure core has no tilt concept). pageTurnTriggered is true
+  // here (we returned above otherwise).
+  const rdr::HeldAction heldAction =
+      fromTilt ? rdr::HeldAction::None
+               : rdr::resolveHeldButtonAction(rdr::HeldButton::PageTurn, mappedInput.getHeldTime(),
+                                              /*released=*/false, SETTINGS.longPressButtonBehavior,
+                                              SETTINGS.longPressMenuFunction, /*pageTurnTriggered=*/true);
 
   // Don't skip chapter after screenshot
   if (gpio.wasReleased(HalGPIO::BTN_POWER) && gpio.wasReleased(HalGPIO::BTN_DOWN)) {
     return;
   }
 
-  if (longPress && SETTINGS.longPressButtonBehavior == SETTINGS.CHAPTER_SKIP) {
+  if (heldAction == rdr::HeldAction::ChapterSkip) {
     if (!nextTriggered && section && section->currentPage > 0) {
       section->currentPage = 0;
       requestUpdate();
@@ -452,7 +428,7 @@ void EpubReaderActivity::loop() {
     return;
   }
 
-  if (longPress && SETTINGS.longPressButtonBehavior == SETTINGS.ORIENTATION_CHANGE) {
+  if (heldAction == rdr::HeldAction::OrientationChange) {
     const uint8_t newOrientation =
         nextTriggered ? (SETTINGS.orientation - 1 + SETTINGS.ORIENTATION_COUNT) % SETTINGS.ORIENTATION_COUNT
                       : (SETTINGS.orientation + 1) % SETTINGS.ORIENTATION_COUNT;
@@ -957,17 +933,6 @@ void EpubReaderActivity::render(RenderLock&& lock) {
     // Collect footnotes from the loaded page
     currentPageFootnotes = std::move(p->footnotes);
 
-    // JOB 3 (glyph prewarm): for SD-card (CJK) reader fonts only, copy this
-    // page's unique codepoints from the laid-out PageLines (S3 — copy now, the
-    // Page is freed below) and hand them to the worker. It populates the
-    // persistent advance table for these glyphs so fast flips through same-script
-    // content (and back-navigation) skip the per-glyph SD advance read. Built-in
-    // fonts live in flash and need no prewarm. Cheap, bounded scan; no SD I/O.
-    const int readerFontId = SETTINGS.getReaderFontId();
-    if (renderer.isSdCardFont(readerFontId)) {
-      enqueueGlyphPrewarmForPage(*p, readerFontId);
-    }
-
     const auto start = millis();
     renderContents(std::move(p), orientedMarginTop, orientedMarginRight, orientedMarginBottom, orientedMarginLeft);
     LOG_DBG("ERS", "Rendered page in %dms", millis() - start);
@@ -1017,103 +982,6 @@ void EpubReaderActivity::silentIndexNextChapterIfNeeded(const uint16_t viewportW
                                      SETTINGS.imageRendering, SETTINGS.focusReadingEnabled)) {
     LOG_ERR("ERS", "Failed silent indexing for chapter: %d", nextSpineIndex);
   }
-}
-
-void EpubReaderActivity::enqueueGlyphPrewarmForPage(const Page& page, const int fontId) {
-  if (!epub) {
-    return;
-  }
-
-  // Collect this page's UNIQUE codepoints into a small UTF-8 buffer, deduping as
-  // we go so we never overflow on a CJK-dense page. The worker's prewarm/advance
-  // path dedups again and caps at MAX_PAGE_GLYPHS, so a bounded sample is enough.
-  // Buffer is one byte smaller than the Job's glyphs[] capacity (NUL-terminated).
-  char buf[512];
-  size_t len = 0;
-  // Track seen codepoints to avoid re-emitting; a flat array keeps it allocation-
-  // free and cache-friendly for the few-hundred unique cps on a page.
-  uint32_t seen[256];
-  size_t seenCount = 0;
-
-  const auto appendCp = [&](uint32_t cp) {
-    if (cp == 0) return;
-    for (size_t i = 0; i < seenCount; ++i) {
-      if (seen[i] == cp) return;
-    }
-    if (seenCount < (sizeof(seen) / sizeof(seen[0]))) {
-      seen[seenCount++] = cp;
-    }
-    // Re-encode the codepoint to UTF-8 into buf (bounded; stop if it won't fit).
-    char tmp[4];
-    int n = 0;
-    if (cp < 0x80) {
-      tmp[n++] = static_cast<char>(cp);
-    } else if (cp < 0x800) {
-      tmp[n++] = static_cast<char>(0xC0 | (cp >> 6));
-      tmp[n++] = static_cast<char>(0x80 | (cp & 0x3F));
-    } else if (cp < 0x10000) {
-      tmp[n++] = static_cast<char>(0xE0 | (cp >> 12));
-      tmp[n++] = static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
-      tmp[n++] = static_cast<char>(0x80 | (cp & 0x3F));
-    } else {
-      tmp[n++] = static_cast<char>(0xF0 | (cp >> 18));
-      tmp[n++] = static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
-      tmp[n++] = static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
-      tmp[n++] = static_cast<char>(0x80 | (cp & 0x3F));
-    }
-    if (len + n >= sizeof(buf)) return;  // full — keep what we have
-    memcpy(buf + len, tmp, n);
-    len += n;
-  };
-
-  for (const auto& el : page.elements) {
-    if (len + 4 >= sizeof(buf) || seenCount >= (sizeof(seen) / sizeof(seen[0]))) {
-      break;  // buffers full — a representative sample of glyphs is sufficient
-    }
-    if (el->getTag() != TAG_PageLine) {
-      continue;
-    }
-    const auto& line = static_cast<const PageLine&>(*el);
-    const auto& block = line.getBlock();
-    if (!block) {
-      continue;
-    }
-    for (const auto& word : block->getWords()) {
-      const unsigned char* p = reinterpret_cast<const unsigned char*>(word.c_str());
-      while (*p) {
-        // Decode one UTF-8 codepoint (defensive; malformed bytes treated as 1).
-        uint32_t cp;
-        if (*p < 0x80) {
-          cp = *p++;
-        } else if ((*p & 0xE0) == 0xC0) {
-          cp = (*p++ & 0x1F) << 6;
-          if ((*p & 0xC0) == 0x80) cp |= (*p++ & 0x3F);
-        } else if ((*p & 0xF0) == 0xE0) {
-          cp = (*p++ & 0x0F) << 12;
-          if ((*p & 0xC0) == 0x80) cp |= (*p++ & 0x3F) << 6;
-          if ((*p & 0xC0) == 0x80) cp |= (*p++ & 0x3F);
-        } else if ((*p & 0xF8) == 0xF0) {
-          cp = (*p++ & 0x07) << 18;
-          if ((*p & 0xC0) == 0x80) cp |= (*p++ & 0x3F) << 12;
-          if ((*p & 0xC0) == 0x80) cp |= (*p++ & 0x3F) << 6;
-          if ((*p & 0xC0) == 0x80) cp |= (*p++ & 0x3F);
-        } else {
-          ++p;
-          continue;
-        }
-        appendCp(cp);
-        if (len + 4 >= sizeof(buf) || seenCount >= (sizeof(seen) / sizeof(seen[0]))) break;
-      }
-    }
-  }
-
-  if (len == 0) {
-    return;
-  }
-  buf[len] = '\0';
-
-  const uint32_t bookHash = static_cast<uint32_t>(std::hash<std::string>{}(epub->getPath()));
-  BG_WORKER.enqueuePrewarmGlyphs(epub->getPath().c_str(), bookHash, fontId, buf);
 }
 
 bool EpubReaderActivity::saveProgress(int spineIndex, int currentPage, int pageCount) {
